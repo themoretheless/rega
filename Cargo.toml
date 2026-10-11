@@ -1,0 +1,27 @@
+[package]
+name = "rega"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Social login & account registration via Google, Apple, Microsoft, GitHub, Facebook, X, LinkedIn, Discord, Yandex, VK, GitLab, Amazon"
+license = "MIT"
+repository = "https://github.com/themoretheless/rega"
+keywords = ["oauth2", "oidc", "login", "auth", "social"]
+categories = ["authentication", "web-programming"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+jsonwebtoken = "9.3"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["sync"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
