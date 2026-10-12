@@ -32,12 +32,40 @@ pub(crate) async fn fetch(
         return map_apple(claims, user);
     }
 
+    if provider == Provider::Google {
+        // Google's id_token already carries sub/email/email_verified/name/picture:
+        // skip the userinfo round-trip.
+        if let Some(id_token) = token.id_token.as_deref() {
+            let claims = apple::id_token_claims(
+                id_token,
+                Some(GOOGLE_ISSUER),
+                &cfg.client_id,
+                pending.nonce.as_deref(),
+            )
+            .or_else(|_| {
+                apple::id_token_claims(
+                    id_token,
+                    Some(GOOGLE_ISSUER_SHORT),
+                    &cfg.client_id,
+                    pending.nonce.as_deref(),
+                )
+            })?;
+            return map_profile(provider, claims);
+        }
+    }
+
     let userinfo = cfg
         .endpoints
         .userinfo
         .as_deref()
         .ok_or_else(|| Error::Config(format!("{provider}: userinfo endpoint is not set")))?;
     let access = &token.access_token;
+
+    if let (Some(nonce), Some(id_token)) = (pending.nonce.as_deref(), token.id_token.as_deref()) {
+        // Bind the session to this login attempt. Microsoft's issuer depends on
+        // the tenant, so only audience/expiry/nonce are enforced here.
+        apple::id_token_claims(id_token, None, &cfg.client_id, Some(nonce))?;
+    }
 
     let req = match provider {
         Provider::Yandex => http
@@ -49,24 +77,24 @@ pub(crate) async fn fetch(
         ]),
         _ => http.get(userinfo).bearer_auth(access),
     };
-    let profile = read_json(req.header("Accept", "application/json").send().await?).await?;
+    let profile = async { read_json(req.header("Accept", "application/json").send().await?).await };
 
-    if let (Some(nonce), Some(id_token)) = (pending.nonce.as_deref(), token.id_token.as_deref()) {
-        // Bind the session to this login attempt. Microsoft's issuer depends on
-        // the tenant, so only audience/expiry/nonce are enforced here.
-        apple::id_token_claims(id_token, None, &cfg.client_id, Some(nonce))?;
-    }
-
-    let mut identity = map_profile(provider, profile)?;
-
-    if provider == Provider::GitHub {
-        if let Some(emails_url) = cfg.endpoints.emails.as_deref() {
-            let emails = read_json(http.get(emails_url).bearer_auth(access).send().await?).await?;
-            apply_github_emails(&mut identity, &emails);
+    match (provider, cfg.endpoints.emails.as_deref()) {
+        (Provider::GitHub, Some(emails_url)) => {
+            // Both GitHub calls only need the token: run them concurrently.
+            let emails =
+                async { read_json(http.get(emails_url).bearer_auth(access).send().await?).await };
+            let (profile, emails) = futures_util::future::join(profile, emails).await;
+            let mut identity = map_profile(provider, profile?)?;
+            apply_github_emails(&mut identity, &emails?);
+            Ok(identity)
         }
+        _ => map_profile(provider, profile.await?),
     }
-    Ok(identity)
 }
+
+const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+const GOOGLE_ISSUER_SHORT: &str = "accounts.google.com";
 
 /// Maps a provider's userinfo payload to an [`ExternalIdentity`].
 pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {

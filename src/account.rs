@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 
 use crate::{ExternalIdentity, Provider};
 
@@ -205,7 +205,8 @@ impl<S: AccountStore> Accounts<S> {
     }
 }
 
-/// In-memory [`AccountStore`] for tests and prototypes.
+/// In-memory [`AccountStore`] for tests and prototypes. All lookups are
+/// O(1) hash-map hits (logins, verified emails, per-user login lists).
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
     inner: RwLock<Inner>,
@@ -216,6 +217,9 @@ pub struct InMemoryStore {
 struct Inner {
     users: HashMap<UserId, NewUser>,
     logins: HashMap<ExternalLogin, UserId>,
+    user_logins: HashMap<UserId, Vec<ExternalLogin>>,
+    /// Lower-cased verified email -> first user registered with it.
+    verified_emails: HashMap<String, UserId>,
 }
 
 impl InMemoryStore {
@@ -223,63 +227,79 @@ impl InMemoryStore {
         Self::default()
     }
 
-    pub async fn user(&self, id: &UserId) -> Option<NewUser> {
-        self.inner.read().await.users.get(id).cloned()
+    pub fn user(&self, id: &UserId) -> Option<NewUser> {
+        self.read().users.get(id).cloned()
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 #[async_trait]
 impl AccountStore for InMemoryStore {
     async fn find_by_login(&self, login: &ExternalLogin) -> Result<Option<UserId>, StoreError> {
-        Ok(self.inner.read().await.logins.get(login).cloned())
+        Ok(self.read().logins.get(login).cloned())
     }
 
     async fn find_by_verified_email(&self, email: &str) -> Result<Option<UserId>, StoreError> {
-        let inner = self.inner.read().await;
-        Ok(inner
-            .users
-            .iter()
-            .find(|(_, u)| {
-                u.email_verified
-                    && u.email
-                        .as_deref()
-                        .is_some_and(|e| e.eq_ignore_ascii_case(email))
-            })
-            .map(|(id, _)| id.clone()))
+        Ok(self
+            .read()
+            .verified_emails
+            .get(&email.to_lowercase())
+            .cloned())
     }
 
     async fn create_user(&self, user: NewUser) -> Result<UserId, StoreError> {
         let id = (self.next_id.fetch_add(1, Ordering::Relaxed) + 1).to_string();
-        self.inner.write().await.users.insert(id.clone(), user);
+        let mut inner = self.write();
+        if let (true, Some(email)) = (user.email_verified, &user.email) {
+            inner
+                .verified_emails
+                .entry(email.to_lowercase())
+                .or_insert_with(|| id.clone());
+        }
+        inner.users.insert(id.clone(), user);
         Ok(id)
     }
 
     async fn add_login(&self, user: &UserId, login: ExternalLogin) -> Result<(), StoreError> {
-        let mut inner = self.inner.write().await;
+        let mut inner = self.write();
         if inner.logins.contains_key(&login) {
             return Err(StoreError::Conflict);
         }
+        inner
+            .user_logins
+            .entry(user.clone())
+            .or_default()
+            .push(login.clone());
         inner.logins.insert(login, user.clone());
         Ok(())
     }
 
     async fn remove_login(&self, user: &UserId, login: &ExternalLogin) -> Result<bool, StoreError> {
-        let mut inner = self.inner.write().await;
-        if inner.logins.get(login) == Some(user) {
-            inner.logins.remove(login);
-            return Ok(true);
+        let mut inner = self.write();
+        if inner.logins.get(login) != Some(user) {
+            return Ok(false);
         }
-        Ok(false)
+        inner.logins.remove(login);
+        if let Some(list) = inner.user_logins.get_mut(user) {
+            list.retain(|l| l != login);
+        }
+        Ok(true)
     }
 
     async fn logins(&self, user: &UserId) -> Result<Vec<ExternalLogin>, StoreError> {
-        let inner = self.inner.read().await;
-        Ok(inner
-            .logins
-            .iter()
-            .filter(|(_, u)| *u == user)
-            .map(|(l, _)| l.clone())
-            .collect())
+        Ok(self
+            .read()
+            .user_logins
+            .get(user)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 

@@ -77,13 +77,14 @@ accounts.unlink(&user_id, &ExternalLogin::from(&identity), /* has_password */ fa
 
 ## Особенности провайдеров
 
-* **Apple** — `client_secret` это ES256-JWT, генерируется из `.p8`-ключа на каждый запрос. Имя пользователя Apple
+* **Apple** — `client_secret` это ES256-JWT из `.p8`-ключа; ключ парсится один раз, секрет кэшируется на час. Имя пользователя Apple
   присылает только при первом входе (поле `user` в callback) — сохраните его сразу.
   Callback приходит POST'ом (`form_post`), поэтому cookie сессии должна быть `SameSite=None; Secure`.
 * **id_token** (Google, Apple, Microsoft, GitLab) проверяется по `iss`/`aud`/`exp`/`nonce`. Подпись не проверяется:
   токен получен напрямую с token endpoint по TLS с аутентификацией клиента (OIDC Core §3.1.3.7).
 * **VK ID** — `device_id` из callback автоматически передаётся при обмене кода.
-* **GitHub** — ошибки приходят как `200 OK` с `{"error": ...}`, библиотека это обрабатывает.
+* **GitHub** — ошибки приходят как `200 OK` с `{"error": ...}`, библиотека это обрабатывает; `/user` и `/user/emails` запрашиваются параллельно.
+* **Google** — профиль берётся из `id_token`, без отдельного запроса к userinfo.
 
 ## Разработка
 

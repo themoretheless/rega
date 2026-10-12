@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::apple::{self, AppleKey};
+use crate::apple::{self, AppleKey, AppleSigner};
 use crate::provider::{ClientAuth, Endpoints};
 use crate::{pkce, profile, Error, ExternalIdentity, Provider, Result};
 
@@ -16,8 +16,9 @@ pub enum ClientSecret {
     /// Public client: PKCE only, no secret.
     None,
     Static(String),
-    /// Sign in with Apple: the secret is generated from the `.p8` key per request.
-    Apple(AppleKey),
+    /// Sign in with Apple: the secret is generated from the `.p8` key and
+    /// cached until shortly before it expires.
+    Apple(AppleSigner),
 }
 
 impl ClientSecret {
@@ -25,7 +26,7 @@ impl ClientSecret {
         match self {
             ClientSecret::None => Ok(None),
             ClientSecret::Static(s) => Ok(Some(s.clone())),
-            ClientSecret::Apple(key) => key.client_secret(client_id).map(Some),
+            ClientSecret::Apple(signer) => signer.client_secret(client_id).map(Some),
         }
     }
 }
@@ -77,7 +78,7 @@ impl ProviderConfig {
         redirect_uri: impl Into<String>,
     ) -> Self {
         let mut cfg = Self::new(Provider::Apple, client_id, "", redirect_uri);
-        cfg.client_secret = ClientSecret::Apple(key);
+        cfg.client_secret = ClientSecret::Apple(AppleSigner::new(key));
         cfg
     }
 

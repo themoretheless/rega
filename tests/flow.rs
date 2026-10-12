@@ -210,3 +210,39 @@ async fn vk_passes_device_id() {
         ("7", false)
     );
 }
+
+#[tokio::test]
+async fn google_profile_comes_from_id_token_without_userinfo_call() {
+    let server = MockServer::start().await;
+    let client = OAuthClient::new().register(
+        ProviderConfig::new(Provider::Google, "gid", "gs", "https://app.test/g")
+            .with_endpoints(endpoints(&server, Some("/userinfo"), None)),
+    );
+    let req = client.authorize(Provider::Google).unwrap();
+    let claims = json!({
+        "iss": "https://accounts.google.com", "aud": "gid", "exp": 4_000_000_000u64,
+        "sub": "1097", "email": "a@gmail.com", "email_verified": true, "name": "A",
+        "nonce": req.pending.nonce.clone().unwrap(),
+    });
+    let id_token = format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims.to_string()));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token":"ya29","id_token": id_token})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/userinfo"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+    let identity = client.complete(&cb, &req.pending).await.unwrap();
+    assert_eq!(
+        (identity.subject.as_str(), identity.email_verified),
+        ("1097", true)
+    );
+}

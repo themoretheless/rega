@@ -25,7 +25,7 @@ pub use account::{
     AccountError, AccountStore, Accounts, ExternalLogin, InMemoryStore, LinkPolicy, NewUser,
     SignInOutcome, StoreError, UserId,
 };
-pub use apple::AppleKey;
+pub use apple::{AppleKey, AppleSigner};
 pub use client::{
     AuthorizationRequest, Callback, ClientSecret, OAuthClient, PendingAuth, ProviderConfig,
     TokenResponse,
