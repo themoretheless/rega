@@ -32,16 +32,20 @@ pub(crate) async fn fetch(
         return map_apple(claims, user);
     }
 
-    if provider == Provider::Google {
-        // Google's id_token already carries sub/email/email_verified/name/picture:
-        // skip the userinfo round-trip.
-        if let Some(id_token) = token.id_token.as_deref() {
-            let claims = apple::id_token_claims(
-                id_token,
-                GOOGLE_ISSUERS,
-                &cfg.client_id,
-                pending.nonce.as_deref(),
-            )?;
+    // OIDC providers: validate the id_token once (binds the response to this
+    // login attempt via nonce) and, when it already carries the profile, skip
+    // the userinfo round-trip. Microsoft/GitLab issuers depend on the tenant or
+    // host, so only audience/expiry/nonce are enforced for them.
+    if let (Some(nonce), Some(id_token)) = (pending.nonce.as_deref(), token.id_token.as_deref()) {
+        let issuers = if provider == Provider::Google {
+            GOOGLE_ISSUERS
+        } else {
+            &[]
+        };
+        let claims = apple::id_token_claims(id_token, issuers, &cfg.client_id, Some(nonce))?;
+        // Google always includes the profile; Microsoft and GitLab only when the
+        // optional `email` claim is configured, otherwise fall back to userinfo.
+        if provider == Provider::Google || claims["email"].is_string() {
             return map_profile(provider, claims);
         }
     }
@@ -52,12 +56,6 @@ pub(crate) async fn fetch(
         .as_deref()
         .ok_or_else(|| Error::Config(format!("{provider}: userinfo endpoint is not set")))?;
     let access = &token.access_token;
-
-    if let (Some(nonce), Some(id_token)) = (pending.nonce.as_deref(), token.id_token.as_deref()) {
-        // Bind the session to this login attempt. Microsoft's issuer depends on
-        // the tenant, so only audience/expiry/nonce are enforced here.
-        apple::id_token_claims(id_token, &[], &cfg.client_id, Some(nonce))?;
-    }
 
     let req = match provider {
         Provider::Yandex => http

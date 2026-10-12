@@ -246,3 +246,70 @@ async fn google_profile_comes_from_id_token_without_userinfo_call() {
         ("1097", true)
     );
 }
+
+async fn oidc_flow(
+    provider: Provider,
+    claims_extra: serde_json::Value,
+    userinfo_calls: u64,
+) -> rega::ExternalIdentity {
+    let server = MockServer::start().await;
+    let client =
+        OAuthClient::new().register(
+            ProviderConfig::new(provider, "cid", "s", "https://app.test/cb")
+                .with_endpoints(endpoints(&server, Some("/userinfo"), None)),
+        );
+    let req = client.authorize(provider).unwrap();
+    let mut claims = json!({
+        "iss": "https://issuer.test", "aud": "cid", "exp": 4_000_000_000u64, "sub": "s1",
+        "nonce": req.pending.nonce.clone().unwrap(),
+    });
+    claims
+        .as_object_mut()
+        .unwrap()
+        .extend(claims_extra.as_object().unwrap().clone());
+    let id_token = format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims.to_string()));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token":"at","id_token": id_token})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/userinfo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"sub":"s1","email":"u@info.test"})),
+        )
+        .expect(userinfo_calls)
+        .mount(&server)
+        .await;
+    let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+    client.complete(&cb, &req.pending).await.unwrap()
+}
+
+#[tokio::test]
+async fn gitlab_and_microsoft_use_id_token_when_it_has_email() {
+    let g = oidc_flow(
+        Provider::GitLab,
+        json!({"email":"G@lab.test","email_verified":true}),
+        0,
+    )
+    .await;
+    assert_eq!(
+        (g.email.as_deref(), g.email_verified),
+        (Some("g@lab.test"), true)
+    );
+    let m = oidc_flow(
+        Provider::Microsoft,
+        json!({"email":"m@ms.test","email_verified":true}),
+        0,
+    )
+    .await;
+    assert!(!m.email_verified);
+}
+
+#[tokio::test]
+async fn falls_back_to_userinfo_without_email_claim() {
+    let m = oidc_flow(Provider::Microsoft, json!({}), 1).await;
+    assert_eq!(m.email.as_deref(), Some("u@info.test"));
+}

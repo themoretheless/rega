@@ -84,7 +84,7 @@ accounts.unlink(&user_id, &ExternalLogin::from(&identity), /* has_password */ fa
   токен получен напрямую с token endpoint по TLS с аутентификацией клиента (OIDC Core §3.1.3.7).
 * **VK ID** — `device_id` из callback автоматически передаётся при обмене кода.
 * **GitHub** — ошибки приходят как `200 OK` с `{"error": ...}`, библиотека это обрабатывает; `/user` и `/user/emails` запрашиваются параллельно.
-* **Google** — профиль берётся из `id_token`, без отдельного запроса к userinfo.
+* **Google, Microsoft, GitLab** — профиль берётся из `id_token`, без отдельного запроса к userinfo (MS/GitLab — если токен содержит `email`).
 
 ## Производительность
 
@@ -97,7 +97,7 @@ accounts.unlink(&user_id, &ExternalLogin::from(&identity), /* has_password */ fa
 | `sign_in` существующего, 10k пользователей | 414 ns | 332 ns |
 | `authorize` URL | 3,7 µs | 3,4 µs (один вызов ОС-RNG вместо трёх) |
 
-Сеть: Google — на 1 HTTP-запрос меньше (профиль из `id_token`), GitHub — 2 запроса профиля параллельно.
+Сеть: Google, Microsoft и GitLab — на 1 HTTP-запрос меньше (профиль из `id_token`, у MS/GitLab — если в нём есть `email`, иначе userinfo), GitHub — 2 запроса профиля параллельно.
 
 ## Разработка
 
