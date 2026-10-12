@@ -136,7 +136,7 @@ pub(crate) fn now() -> u64 {
 /// in this case; issuer, audience, expiry and nonce are still verified.
 pub(crate) fn id_token_claims(
     id_token: &str,
-    issuer: Option<&str>,
+    issuers: &[&str],
     client_id: &str,
     nonce: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -149,10 +149,12 @@ pub(crate) fn id_token_claims(
         .map_err(|e| Error::IdToken(e.to_string()))?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes)?;
 
-    if let Some(issuer) = issuer {
-        if claims["iss"].as_str() != Some(issuer) {
-            return Err(Error::IdToken("unexpected issuer".into()));
-        }
+    if !issuers.is_empty()
+        && !claims["iss"]
+            .as_str()
+            .is_some_and(|iss| issuers.contains(&iss))
+    {
+        return Err(Error::IdToken("unexpected issuer".into()));
     }
     let aud_ok = match &claims["aud"] {
         serde_json::Value::String(a) => a == client_id,
@@ -202,17 +204,17 @@ mod tests {
             "iss": ISSUER, "aud": "app", "exp": now() + 600, "nonce": "n", "sub": "001"
         }));
         assert_eq!(
-            id_token_claims(&t, Some(ISSUER), "app", Some("n")).unwrap()["sub"],
+            id_token_claims(&t, &[ISSUER], "app", Some("n")).unwrap()["sub"],
             "001"
         );
-        assert!(id_token_claims(&t, Some(ISSUER), "other", Some("n")).is_err());
-        assert!(id_token_claims(&t, Some(ISSUER), "app", Some("x")).is_err());
-        assert!(id_token_claims(&t, Some("evil"), "app", Some("n")).is_err());
+        assert!(id_token_claims(&t, &[ISSUER], "other", Some("n")).is_err());
+        assert!(id_token_claims(&t, &[ISSUER], "app", Some("x")).is_err());
+        assert!(id_token_claims(&t, &["evil"], "app", Some("n")).is_err());
     }
 
     #[test]
     fn rejects_expired() {
         let t = token(serde_json::json!({ "iss": ISSUER, "aud": "app", "exp": 1 }));
-        assert!(id_token_claims(&t, Some(ISSUER), "app", None).is_err());
+        assert!(id_token_claims(&t, &[ISSUER], "app", None).is_err());
     }
 }

@@ -4,10 +4,17 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 /// Cryptographically random URL-safe token (32 bytes of entropy).
+#[cfg(test)]
 pub(crate) fn random_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
+    let [t] = random_tokens::<1>();
+    t
+}
+
+/// `N` independent random tokens from a single OS RNG read.
+pub(crate) fn random_tokens<const N: usize>() -> [String; N] {
+    let mut bytes = [[0u8; 32]; N];
+    rand::rngs::OsRng.fill_bytes(bytes.as_flattened_mut());
+    bytes.map(|b| URL_SAFE_NO_PAD.encode(b))
 }
 
 /// S256 code challenge for a PKCE verifier (RFC 7636).

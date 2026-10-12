@@ -21,7 +21,7 @@ pub(crate) async fn fetch(
             .ok_or_else(|| Error::InvalidResponse("Apple did not return an id_token".into()))?;
         let claims = apple::id_token_claims(
             id_token,
-            Some(apple::ISSUER),
+            &[apple::ISSUER],
             &cfg.client_id,
             pending.nonce.as_deref(),
         )?;
@@ -38,18 +38,10 @@ pub(crate) async fn fetch(
         if let Some(id_token) = token.id_token.as_deref() {
             let claims = apple::id_token_claims(
                 id_token,
-                Some(GOOGLE_ISSUER),
+                GOOGLE_ISSUERS,
                 &cfg.client_id,
                 pending.nonce.as_deref(),
-            )
-            .or_else(|_| {
-                apple::id_token_claims(
-                    id_token,
-                    Some(GOOGLE_ISSUER_SHORT),
-                    &cfg.client_id,
-                    pending.nonce.as_deref(),
-                )
-            })?;
+            )?;
             return map_profile(provider, claims);
         }
     }
@@ -64,7 +56,7 @@ pub(crate) async fn fetch(
     if let (Some(nonce), Some(id_token)) = (pending.nonce.as_deref(), token.id_token.as_deref()) {
         // Bind the session to this login attempt. Microsoft's issuer depends on
         // the tenant, so only audience/expiry/nonce are enforced here.
-        apple::id_token_claims(id_token, None, &cfg.client_id, Some(nonce))?;
+        apple::id_token_claims(id_token, &[], &cfg.client_id, Some(nonce))?;
     }
 
     let req = match provider {
@@ -93,8 +85,7 @@ pub(crate) async fn fetch(
     }
 }
 
-const GOOGLE_ISSUER: &str = "https://accounts.google.com";
-const GOOGLE_ISSUER_SHORT: &str = "accounts.google.com";
+const GOOGLE_ISSUERS: &[&str] = &["https://accounts.google.com", "accounts.google.com"];
 
 /// Maps a provider's userinfo payload to an [`ExternalIdentity`].
 pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {

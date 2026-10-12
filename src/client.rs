@@ -221,9 +221,9 @@ impl OAuthClient {
         let mut url = Url::parse(&cfg.endpoints.authorize)
             .map_err(|e| Error::Config(format!("authorize endpoint: {e}")))?;
 
-        let state = pkce::random_token();
-        let nonce = provider.uses_nonce().then(pkce::random_token);
-        let code_verifier = provider.supports_pkce().then(pkce::random_token);
+        let [state, nonce, code_verifier] = pkce::random_tokens::<3>();
+        let nonce = provider.uses_nonce().then_some(nonce);
+        let code_verifier = provider.supports_pkce().then_some(code_verifier);
 
         {
             let mut q = url.query_pairs_mut();

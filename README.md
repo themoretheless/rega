@@ -86,11 +86,25 @@ accounts.unlink(&user_id, &ExternalLogin::from(&identity), /* has_password */ fa
 * **GitHub** — ошибки приходят как `200 OK` с `{"error": ...}`, библиотека это обрабатывает; `/user` и `/user/emails` запрашиваются параллельно.
 * **Google** — профиль берётся из `id_token`, без отдельного запроса к userinfo.
 
+## Производительность
+
+`cargo bench` (criterion, `benches/hot_paths.rs`), до/после оптимизаций:
+
+| Операция | До | После |
+|---|---|---|
+| Apple `client_secret` | 44 µs (PEM + ES256 на каждый вход) | 76 ns (кэш, перевыпуск раз в час) |
+| `find_by_verified_email`, 10k пользователей | 11 µs (перебор) | 0,33 µs (индекс) |
+| `sign_in` существующего, 10k пользователей | 414 ns | 332 ns |
+| `authorize` URL | 3,7 µs | 3,4 µs (один вызов ОС-RNG вместо трёх) |
+
+Сеть: Google — на 1 HTTP-запрос меньше (профиль из `id_token`), GitHub — 2 запроса профиля параллельно.
+
 ## Разработка
 
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
+cargo bench
 ```
 
 `tests/apple_test_key.p8` — одноразовый тестовый ключ, не связанный ни с каким Apple-аккаунтом.
