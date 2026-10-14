@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Integrations
+- `axum` feature: `AuthRoutes` with `/auth/{provider}` and `/auth/{provider}/callback`
+  (GET + POST for Apple), state in an encrypted `HttpOnly` cookie, safe error responses.
+- `postgres` feature: `PgAccountStore` on sqlx + `migrations/0001_rega.sql`.
+- TLS backend selectable: `rustls` (default) or `native-tls`.
+
 ### Security / fixes
 - HTTP connect (5 s) and request (15 s) timeouts; provider responses capped at 1 MiB.
 - `id_token` signature verification against provider JWKS (Google, Apple, Microsoft, GitLab):

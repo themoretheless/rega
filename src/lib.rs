@@ -40,6 +40,8 @@
 
 mod account;
 mod apple;
+#[cfg(feature = "axum")]
+pub mod axum;
 mod client;
 #[cfg(feature = "cookie")]
 mod cookie;
@@ -47,6 +49,8 @@ mod error;
 mod identity;
 mod jwks;
 mod pkce;
+#[cfg(feature = "postgres")]
+mod postgres;
 pub mod profile;
 mod provider;
 pub mod telegram;
@@ -62,4 +66,6 @@ pub use client::{
 };
 pub use error::{Error, Result};
 pub use identity::ExternalIdentity;
+#[cfg(feature = "postgres")]
+pub use postgres::{PgAccountStore, SCHEMA as POSTGRES_SCHEMA};
 pub use provider::{ClientAuth, Endpoints, Provider};
