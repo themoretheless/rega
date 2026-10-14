@@ -6,17 +6,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+    /// Google (OpenID Connect).
     Google,
+    /// Sign in with Apple.
     Apple,
+    /// Microsoft personal and work/school accounts.
     Microsoft,
+    /// Facebook Login.
     Facebook,
+    /// GitHub OAuth apps.
     GitHub,
+    /// X (Twitter) OAuth 2.0.
     X,
+    /// LinkedIn (OpenID Connect).
     LinkedIn,
+    /// Discord.
     Discord,
+    /// Yandex ID.
     Yandex,
+    /// VK ID.
     Vk,
+    /// GitLab (gitlab.com or self-hosted).
     GitLab,
+    /// Login with Amazon.
     Amazon,
 }
 
@@ -33,7 +45,9 @@ pub enum ClientAuth {
 /// them for self-hosted GitLab, a specific Microsoft tenant, or tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoints {
+    /// Authorization endpoint.
     pub authorize: String,
+    /// Token endpoint.
     pub token: String,
     /// Profile endpoint. `None` when the profile comes from the `id_token` (Apple).
     pub userinfo: Option<String>,
@@ -46,6 +60,7 @@ pub struct Endpoints {
 }
 
 impl Provider {
+    /// Every supported provider.
     pub const ALL: [Provider; 12] = [
         Provider::Google,
         Provider::Apple,
@@ -61,6 +76,7 @@ impl Provider {
         Provider::Amazon,
     ];
 
+    /// Stable lower-case identifier, e.g. `"google"`.
     pub fn as_str(self) -> &'static str {
         match self {
             Provider::Google => "google",
@@ -78,6 +94,7 @@ impl Provider {
         }
     }
 
+    /// Default endpoints of the provider.
     pub fn endpoints(self) -> Endpoints {
         let (authorize, token, userinfo, emails) = match self {
             Provider::Google => (
@@ -198,6 +215,7 @@ impl Provider {
         }
     }
 
+    /// Scopes requested by default: enough for id, email, name and avatar.
     pub fn default_scopes(self) -> &'static [&'static str] {
         match self {
             Provider::Google | Provider::Microsoft | Provider::LinkedIn | Provider::GitLab => {
@@ -221,6 +239,7 @@ impl Provider {
         }
     }
 
+    /// How the client authenticates at the token endpoint.
     pub fn client_auth(self) -> ClientAuth {
         match self {
             Provider::X | Provider::Discord => ClientAuth::Basic,

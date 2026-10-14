@@ -22,6 +22,7 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 pub enum ClientSecret {
     /// Public client: PKCE only, no secret.
     None,
+    /// Fixed client secret.
     Static(String),
     /// Sign in with Apple: the secret is generated from the `.p8` key and
     /// cached until shortly before it expires.
@@ -48,11 +49,17 @@ impl ClientSecret {
 /// Application registration at a provider.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
+    /// Provider this registration belongs to.
     pub provider: Provider,
+    /// OAuth client id.
     pub client_id: String,
+    /// Credential for the token endpoint.
     pub client_secret: ClientSecret,
+    /// Redirect URI registered at the provider.
     pub redirect_uri: String,
+    /// Requested scopes; defaults to [`Provider::default_scopes`].
     pub scopes: Vec<String>,
+    /// Provider endpoints; defaults to [`Provider::endpoints`].
     pub endpoints: Endpoints,
     /// Extra query parameters for the authorization URL (`prompt`, `hd`, ...).
     pub authorize_params: Vec<(String, String)>,
@@ -65,6 +72,7 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// Registration with default scopes and endpoints. An empty secret makes a public (PKCE-only) client.
     pub fn new(
         provider: Provider,
         client_id: impl Into<String>,
@@ -103,6 +111,7 @@ impl ProviderConfig {
         cfg
     }
 
+    /// Replaces the requested scopes.
     pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -112,6 +121,7 @@ impl ProviderConfig {
         self
     }
 
+    /// Overrides the endpoints (self-hosted GitLab, Microsoft tenant, tests).
     pub fn with_endpoints(mut self, endpoints: Endpoints) -> Self {
         self.endpoints = endpoints;
         self
@@ -123,6 +133,7 @@ impl ProviderConfig {
         self
     }
 
+    /// Adds an extra query parameter to the authorization URL.
     pub fn with_authorize_param(
         mut self,
         key: impl Into<String>,
@@ -138,17 +149,24 @@ impl ProviderConfig {
 /// it contains the PKCE verifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingAuth {
+    /// Provider the login was started with.
     pub provider: Provider,
+    /// Anti-CSRF `state` value.
     pub state: String,
+    /// OIDC `nonce`, for providers that issue an `id_token`.
     pub nonce: Option<String>,
+    /// PKCE verifier, for providers that support PKCE.
     pub code_verifier: Option<String>,
+    /// Unix time the attempt was started.
     pub created_at: u64,
 }
 
 /// Where to send the user, plus the state to keep until the callback.
 #[derive(Debug, Clone)]
 pub struct AuthorizationRequest {
+    /// URL to redirect the user to.
     pub url: Url,
+    /// State to keep until the callback.
     pub pending: PendingAuth,
 }
 
@@ -160,6 +178,7 @@ pub struct Callback {
 }
 
 impl Callback {
+    /// Value of a callback parameter.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.params.get(key).map(String::as_str)
     }
@@ -184,16 +203,22 @@ impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Callback {
 /// Token endpoint response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenResponse {
+    /// Access token.
     pub access_token: String,
     #[serde(default)]
+    /// Token type, usually `Bearer`.
     pub token_type: Option<String>,
     #[serde(default)]
+    /// OIDC `id_token`.
     pub id_token: Option<String>,
     #[serde(default)]
+    /// Refresh token, if issued.
     pub refresh_token: Option<String>,
     #[serde(default)]
+    /// Access token lifetime in seconds.
     pub expires_in: Option<u64>,
     #[serde(flatten)]
+    /// Provider-specific extra fields.
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -212,6 +237,7 @@ impl Default for OAuthClient {
 }
 
 impl OAuthClient {
+    /// Client with sane defaults: no redirects, 5 s connect and 15 s request timeouts.
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!("rega/", env!("CARGO_PKG_VERSION")))
@@ -223,6 +249,7 @@ impl OAuthClient {
         Self::with_http_client(http)
     }
 
+    /// Client using a custom HTTP client (proxies, custom TLS, timeouts).
     pub fn with_http_client(http: reqwest::Client) -> Self {
         Self {
             http,
@@ -231,6 +258,7 @@ impl OAuthClient {
         }
     }
 
+    /// Registers (or replaces) a provider.
     pub fn register(mut self, config: ProviderConfig) -> Self {
         match &config.endpoints.jwks {
             Some(url) => {
@@ -300,10 +328,12 @@ impl OAuthClient {
         read_json(resp).await.map(drop)
     }
 
+    /// Registered providers.
     pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {
         self.providers.keys().copied()
     }
 
+    /// Registration of `provider`.
     pub fn config(&self, provider: Provider) -> Result<&ProviderConfig> {
         self.providers
             .get(&provider)

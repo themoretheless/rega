@@ -473,3 +473,103 @@ mod hardening {
         ));
     }
 }
+
+mod all_providers {
+    use super::*;
+    use wiremock::matchers::query_param;
+
+    async fn run(
+        provider: Provider,
+        profile: serde_json::Value,
+        expect_sub: &str,
+    ) -> rega::ExternalIdentity {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"AT"})))
+            .mount(&server)
+            .await;
+        let userinfo = Mock::given(path("/me"));
+        let userinfo = match provider {
+            Provider::Yandex => userinfo.and(header("authorization", "OAuth AT")),
+            Provider::Facebook => userinfo.and(query_param(
+                "appsecret_proof",
+                // HMAC-SHA256(key = "s", msg = "AT")
+                "b13552a043dc28fa6891bd0b38e0bb473b5a507c053b8117740e34cd032dfd3a",
+            )),
+            _ => userinfo.and(header("authorization", "Bearer AT")),
+        };
+        userinfo
+            .respond_with(ResponseTemplate::new(200).set_body_json(profile))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(provider, "cid", "s", "https://app.test/cb")
+                .with_endpoints(endpoints(&server, Some("/me"), None)),
+        );
+        let req = client.authorize(provider).unwrap();
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        let identity = client.complete(&cb, &req.pending).await.unwrap();
+        assert_eq!(identity.subject, expect_sub, "{provider}");
+        assert_eq!(identity.provider, provider);
+        identity
+    }
+
+    #[tokio::test]
+    async fn facebook() {
+        let i = run(
+            Provider::Facebook,
+            json!({"id":"10","name":"F","email":"f@fb.test"}),
+            "10",
+        )
+        .await;
+        assert!(i.email_verified);
+    }
+
+    #[tokio::test]
+    async fn x() {
+        run(Provider::X, json!({"data":{"id":"11","name":"X"}}), "11").await;
+    }
+
+    #[tokio::test]
+    async fn linkedin() {
+        let i = run(
+            Provider::LinkedIn,
+            json!({"sub":"li","email":"l@in.test","email_verified":true}),
+            "li",
+        )
+        .await;
+        assert!(i.email_verified);
+    }
+
+    #[tokio::test]
+    async fn discord() {
+        run(
+            Provider::Discord,
+            json!({"id":"12","username":"d","verified":false}),
+            "12",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn yandex() {
+        run(
+            Provider::Yandex,
+            json!({"id":"13","default_email":"y@ya.ru"}),
+            "13",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn amazon() {
+        run(
+            Provider::Amazon,
+            json!({"user_id":"amzn1.account.X","email":"a@amz.test"}),
+            "amzn1.account.X",
+        )
+        .await;
+    }
+}

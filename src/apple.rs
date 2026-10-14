@@ -14,7 +14,9 @@ const APPLE_ISSUER: &str = "https://appleid.apple.com";
 /// static client secret: it is a short-lived ES256 JWT signed with this key.
 #[derive(Clone)]
 pub struct AppleKey {
+    /// Apple Developer Team ID.
     pub team_id: String,
+    /// Key ID of the Sign in with Apple key.
     pub key_id: String,
     /// PEM contents of the `.p8` file.
     pub private_key_pem: String,
@@ -87,6 +89,7 @@ impl std::fmt::Debug for SignerCache {
 }
 
 impl AppleSigner {
+    /// Wraps a key; nothing is parsed until the first secret is requested.
     pub fn new(key: AppleKey) -> Self {
         Self {
             key,
@@ -94,6 +97,7 @@ impl AppleSigner {
         }
     }
 
+    /// The wrapped key.
     pub fn key(&self) -> &AppleKey {
         &self.key
     }
