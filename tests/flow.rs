@@ -14,6 +14,8 @@ fn endpoints(server: &MockServer, userinfo: Option<&str>, emails: Option<&str>) 
         token: format!("{}/token", server.uri()),
         userinfo: userinfo.map(|p| format!("{}{p}", server.uri())),
         emails: emails.map(|p| format!("{}{p}", server.uri())),
+        jwks: Some(format!("{}/jwks", server.uri())),
+        revoke: Some(format!("{}/revoke", server.uri())),
     }
 }
 
@@ -312,4 +314,418 @@ async fn gitlab_and_microsoft_use_id_token_when_it_has_email() {
 async fn falls_back_to_userinfo_without_email_claim() {
     let m = oidc_flow(Provider::Microsoft, json!({}), 1).await;
     assert_eq!(m.email.as_deref(), Some("u@info.test"));
+}
+
+mod hardening {
+    use super::*;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+
+    fn signed(claims: &serde_json::Value, kid: &str) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(kid.into());
+        let key = EncodingKey::from_ec_pem(include_bytes!("apple_test_key.p8")).unwrap();
+        jsonwebtoken::encode(&header, claims, &key).unwrap()
+    }
+
+    async fn jwks_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(include_str!("test_jwks.json"), "application/json"),
+            )
+            .expect(1) // cached after the first fetch
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn verify_id_token_checks_signature_issuer_and_audience() {
+        let server = jwks_server().await;
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(Provider::Google, "web-id", "s", "https://app.test/cb")
+                .with_endpoints(endpoints(&server, None, None)),
+        );
+        let claims = json!({
+            "iss": "https://accounts.google.com", "aud": "ios-id", "exp": 4_000_000_000u64,
+            "sub": "42", "email": "M@Gmail.com", "email_verified": true,
+        });
+        let ok = client
+            .verify_id_token(
+                Provider::Google,
+                &signed(&claims, "test-kid"),
+                Some("ios-id"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (ok.subject.as_str(), ok.email.as_deref()),
+            ("42", Some("m@gmail.com"))
+        );
+
+        // Wrong audience, forged signature and unknown kid must all fail.
+        let token = signed(&claims, "test-kid");
+        assert!(client
+            .verify_id_token(Provider::Google, &token, None, None)
+            .await
+            .is_err());
+        let mut forged = token.clone();
+        forged.replace_range(forged.len() - 4.., "AAAA");
+        assert!(client
+            .verify_id_token(Provider::Google, &forged, Some("ios-id"), None)
+            .await
+            .is_err());
+        let mut evil = claims.clone();
+        evil["iss"] = json!("https://evil.test");
+        assert!(client
+            .verify_id_token(
+                Provider::Google,
+                &signed(&evil, "test-kid"),
+                Some("ios-id"),
+                None
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn code_flow_can_verify_signatures() {
+        let server = jwks_server().await;
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(Provider::Google, "gid", "s", "https://app.test/cb")
+                .with_endpoints(endpoints(&server, Some("/userinfo"), None))
+                .with_signature_verification(),
+        );
+        let req = client.authorize(Provider::Google).unwrap();
+        let claims = json!({
+            "iss": "https://accounts.google.com", "aud": "gid", "exp": 4_000_000_000u64,
+            "sub": "7", "nonce": req.pending.nonce.clone().unwrap(),
+        });
+        Mock::given(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"access_token":"a","id_token": signed(&claims, "test-kid")}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        assert_eq!(
+            client.complete(&cb, &req.pending).await.unwrap().subject,
+            "7"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_posts_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .and(body_string_contains("token=rt-1"))
+            .and(body_string_contains("client_secret=s"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(Provider::Google, "gid", "s", "https://app.test/cb")
+                .with_endpoints(endpoints(&server, None, None)),
+        );
+        client
+            .revoke(Provider::Google, "rt-1", Some("refresh_token"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(2 << 20)))
+            .mount(&server)
+            .await;
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(Provider::GitHub, "c", "s", "https://app.test/cb")
+                .with_endpoints(endpoints(&server, Some("/user"), None)),
+        );
+        let req = client.authorize(Provider::GitHub).unwrap();
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        let err = client.complete(&cb, &req.pending).await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn expired_pending_auth() {
+        let client = OAuthClient::new().register(ProviderConfig::new(
+            Provider::GitHub,
+            "c",
+            "s",
+            "https://app.test/cb",
+        ));
+        let mut req = client.authorize(Provider::GitHub).unwrap();
+        req.pending.created_at -= 3600;
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        assert!(matches!(
+            client.complete(&cb, &req.pending).await,
+            Err(rega::Error::Expired)
+        ));
+    }
+}
+
+mod all_providers {
+    use super::*;
+    use wiremock::matchers::query_param;
+
+    async fn run(
+        provider: Provider,
+        profile: serde_json::Value,
+        expect_sub: &str,
+    ) -> rega::ExternalIdentity {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"AT"})))
+            .mount(&server)
+            .await;
+        let userinfo = Mock::given(path("/me"));
+        let userinfo = match provider {
+            Provider::Yandex => userinfo.and(header("authorization", "OAuth AT")),
+            Provider::MailRu => userinfo.and(query_param("access_token", "AT")),
+            Provider::Facebook => userinfo.and(query_param(
+                "appsecret_proof",
+                // HMAC-SHA256(key = "s", msg = "AT")
+                "b13552a043dc28fa6891bd0b38e0bb473b5a507c053b8117740e34cd032dfd3a",
+            )),
+            _ => userinfo.and(header("authorization", "Bearer AT")),
+        };
+        userinfo
+            .respond_with(ResponseTemplate::new(200).set_body_json(profile))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(provider, "cid", "s", "https://app.test/cb")
+                .with_endpoints(endpoints(&server, Some("/me"), None)),
+        );
+        let req = client.authorize(provider).unwrap();
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        let identity = client.complete(&cb, &req.pending).await.unwrap();
+        assert_eq!(identity.subject, expect_sub, "{provider}");
+        assert_eq!(identity.provider, provider);
+        identity
+    }
+
+    #[tokio::test]
+    async fn facebook() {
+        let i = run(
+            Provider::Facebook,
+            json!({"id":"10","name":"F","email":"f@fb.test"}),
+            "10",
+        )
+        .await;
+        assert!(i.email_verified);
+    }
+
+    #[tokio::test]
+    async fn x() {
+        run(Provider::X, json!({"data":{"id":"11","name":"X"}}), "11").await;
+    }
+
+    #[tokio::test]
+    async fn linkedin() {
+        let i = run(
+            Provider::LinkedIn,
+            json!({"sub":"li","email":"l@in.test","email_verified":true}),
+            "li",
+        )
+        .await;
+        assert!(i.email_verified);
+    }
+
+    #[tokio::test]
+    async fn discord() {
+        run(
+            Provider::Discord,
+            json!({"id":"12","username":"d","verified":false}),
+            "12",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn yandex() {
+        run(
+            Provider::Yandex,
+            json!({"id":"13","default_email":"y@ya.ru"}),
+            "13",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn amazon() {
+        run(
+            Provider::Amazon,
+            json!({"user_id":"amzn1.account.X","email":"a@amz.test"}),
+            "amzn1.account.X",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn twitch() {
+        let i = run(Provider::Twitch, json!({"sub":"tw","email":"t@tv.test","email_verified":true,"preferred_username":"tw_user"}), "tw").await;
+        assert_eq!(
+            (i.name.as_deref(), i.email_verified),
+            (Some("tw_user"), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn slack() {
+        run(
+            Provider::Slack,
+            json!({"ok":true,"sub":"U1","email":"s@sl.test","email_verified":true}),
+            "U1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn spotify() {
+        let i = run(
+            Provider::Spotify,
+            json!({"id":"sp","display_name":"S","images":[{"url":"img"}]}),
+            "sp",
+        )
+        .await;
+        assert_eq!(i.avatar_url.as_deref(), Some("img"));
+    }
+
+    #[tokio::test]
+    async fn reddit() {
+        run(Provider::Reddit, json!({"id":"rd","name":"r"}), "rd").await;
+    }
+
+    #[tokio::test]
+    async fn mailru() {
+        run(
+            Provider::MailRu,
+            json!({"id":"m1","email":"m@mail.ru","name":"M"}),
+            "m1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bitbucket_reads_confirmed_email() {
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"AT"})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/user"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"uuid":"{b1}","display_name":"B"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/emails"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"values":[{"email":"B@bb.test","is_primary":true,"is_confirmed":true}]}),
+            ))
+            .mount(&server)
+            .await;
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(Provider::Bitbucket, "c", "s", "https://app.test/cb")
+                .with_endpoints(endpoints(&server, Some("/user"), Some("/emails"))),
+        );
+        let req = client.authorize(Provider::Bitbucket).unwrap();
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        let i = client.complete(&cb, &req.pending).await.unwrap();
+        assert_eq!(
+            (i.subject.as_str(), i.email.as_deref(), i.email_verified),
+            ("{b1}", Some("b@bb.test"), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_has_no_redirect_flow() {
+        let client = OAuthClient::new().register(ProviderConfig::new(
+            Provider::Telegram,
+            "bot",
+            "",
+            "https://a/cb",
+        ));
+        assert!(client.authorize(Provider::Telegram).is_err());
+    }
+}
+
+mod features {
+    use super::*;
+
+    #[tokio::test]
+    async fn discovery_and_refresh() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "userinfo_endpoint": format!("{base}/userinfo"),
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=rt"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"new","expires_in":3600})),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let ep = Endpoints::discover(&http, &format!("{base}/"))
+            .await
+            .unwrap();
+        assert_eq!(ep.token, format!("{base}/token"));
+        assert_eq!(ep.jwks.as_deref(), Some(format!("{base}/jwks").as_str()));
+
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(Provider::GitLab, "c", "s", "https://a/cb").with_endpoints(ep),
+        );
+        let t = client.refresh(Provider::GitLab, "rt").await.unwrap();
+        assert_eq!((t.access_token.as_str(), t.expires_in), ("new", Some(3600)));
+    }
+
+    #[test]
+    fn endpoint_helpers() {
+        let ms = Endpoints::microsoft_tenant("contoso.onmicrosoft.com");
+        assert!(ms
+            .authorize
+            .contains("/contoso.onmicrosoft.com/oauth2/v2.0/authorize"));
+        let gl = Endpoints::gitlab("https://git.example.com/");
+        assert_eq!(gl.token, "https://git.example.com/oauth/token");
+    }
+
+    #[test]
+    fn twitch_requests_userinfo_claims() {
+        let client = OAuthClient::new().register(ProviderConfig::new(
+            Provider::Twitch,
+            "c",
+            "s",
+            "https://a/cb",
+        ));
+        let url = client.authorize(Provider::Twitch).unwrap().url;
+        assert!(url
+            .query_pairs()
+            .any(|(k, v)| k == "claims" && v.contains("email_verified")));
+    }
 }

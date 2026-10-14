@@ -81,5 +81,51 @@ fn store(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, apple_secret, authorize, store);
+fn jwks_verify(c: &mut Criterion) {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(include_str!("../tests/test_jwks.json"), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        server
+    });
+    let mut endpoints = Provider::Google.endpoints();
+    endpoints.jwks = Some(format!("{}/jwks", server.uri()));
+    let client = OAuthClient::new().register(
+        ProviderConfig::new(Provider::Google, "aud", "s", "https://app.test/cb")
+            .with_endpoints(endpoints),
+    );
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some("test-kid".into());
+    let claims = serde_json::json!({
+        "iss": "https://accounts.google.com", "aud": "aud", "exp": 4_000_000_000u64, "sub": "1",
+    });
+    let token = jsonwebtoken::encode(
+        &header,
+        &claims,
+        &EncodingKey::from_ec_pem(PEM.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    rt.block_on(client.verify_id_token(Provider::Google, &token, None, None))
+        .unwrap();
+    c.bench_function("verify_id_token (cached JWKS, ES256)", |b| {
+        b.iter(|| {
+            rt.block_on(client.verify_id_token(Provider::Google, black_box(&token), None, None))
+                .unwrap()
+        })
+    });
+}
+
+criterion_group!(benches, apple_secret, authorize, store, jwks_verify);
 criterion_main!(benches);

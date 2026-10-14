@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ExternalIdentity, Provider};
 
+/// Local user identifier as stored by the application.
 pub type UserId = String;
 
 /// A provider login attached to a local user.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExternalLogin {
+    /// Identity provider.
     pub provider: Provider,
+    /// Provider-unique user id.
     pub subject: String,
 }
 
@@ -28,9 +31,13 @@ impl From<&ExternalIdentity> for ExternalLogin {
 /// Profile used to create a user on first sign-in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewUser {
+    /// Email address, lower-cased.
     pub email: Option<String>,
+    /// Whether the provider guarantees ownership of `email`.
     pub email_verified: bool,
+    /// Display name.
     pub name: Option<String>,
+    /// Avatar URL.
     pub avatar_url: Option<String>,
 }
 
@@ -46,11 +53,13 @@ impl From<&ExternalIdentity> for NewUser {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Error returned by an [`AccountStore`].
 pub enum StoreError {
     /// The login is already attached to a user (unique constraint).
     #[error("login is already linked")]
     Conflict,
     #[error("storage error: {0}")]
+    /// Any other storage failure.
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -58,13 +67,17 @@ pub enum StoreError {
 /// your database; the `(provider, subject)` pair must be unique.
 #[async_trait]
 pub trait AccountStore: Send + Sync {
+    /// User owning the login, if any.
     async fn find_by_login(&self, login: &ExternalLogin) -> Result<Option<UserId>, StoreError>;
     /// User whose email is **verified** and equal to `email` (case-insensitive).
     async fn find_by_verified_email(&self, email: &str) -> Result<Option<UserId>, StoreError>;
+    /// Creates a user and returns its id.
     async fn create_user(&self, user: NewUser) -> Result<UserId, StoreError>;
     /// Must return [`StoreError::Conflict`] if the login belongs to any user.
     async fn add_login(&self, user: &UserId, login: ExternalLogin) -> Result<(), StoreError>;
+    /// Detaches `login` from `user`; returns whether it was attached.
     async fn remove_login(&self, user: &UserId, login: &ExternalLogin) -> Result<bool, StoreError>;
+    /// All logins attached to `user`.
     async fn logins(&self, user: &UserId) -> Result<Vec<ExternalLogin>, StoreError>;
 }
 
@@ -80,6 +93,7 @@ pub enum LinkPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of [`Accounts::sign_in`].
 pub enum SignInOutcome {
     /// Known login — existing user.
     SignedIn(UserId),
@@ -90,6 +104,7 @@ pub enum SignInOutcome {
 }
 
 impl SignInOutcome {
+    /// The local user id, whatever the outcome.
     pub fn user_id(&self) -> &UserId {
         match self {
             Self::SignedIn(u) | Self::Linked(u) | Self::Registered(u) => u,
@@ -98,12 +113,16 @@ impl SignInOutcome {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Error returned by [`Accounts`] operations.
 pub enum AccountError {
     #[error("this {0} account is already linked to another user")]
+    /// The provider login already belongs to a different user.
     LinkedToAnotherUser(Provider),
     #[error("cannot remove the only login method")]
+    /// Removing this login would leave the user unable to sign in.
     LastLogin,
     #[error(transparent)]
+    /// Storage failure.
     Store(#[from] StoreError),
 }
 
@@ -114,6 +133,7 @@ pub struct Accounts<S> {
 }
 
 impl<S: AccountStore> Accounts<S> {
+    /// Creates the service with [`LinkPolicy::VerifiedEmail`].
     pub fn new(store: S) -> Self {
         Self {
             store,
@@ -121,11 +141,13 @@ impl<S: AccountStore> Accounts<S> {
         }
     }
 
+    /// Sets the auto-link policy.
     pub fn with_policy(mut self, policy: LinkPolicy) -> Self {
         self.policy = policy;
         self
     }
 
+    /// Underlying store.
     pub fn store(&self) -> &S {
         &self.store
     }
@@ -223,10 +245,12 @@ struct Inner {
 }
 
 impl InMemoryStore {
+    /// Creates an empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Profile of a user, if it exists.
     pub fn user(&self, id: &UserId) -> Option<NewUser> {
         self.read().users.get(id).cloned()
     }
@@ -250,7 +274,7 @@ impl AccountStore for InMemoryStore {
         Ok(self
             .read()
             .verified_emails
-            .get(&email.to_lowercase())
+            .get(&crate::profile::normalize_email(email))
             .cloned())
     }
 
@@ -260,7 +284,7 @@ impl AccountStore for InMemoryStore {
         if let (true, Some(email)) = (user.email_verified, &user.email) {
             inner
                 .verified_emails
-                .entry(email.to_lowercase())
+                .entry(crate::profile::normalize_email(email))
                 .or_insert_with(|| id.clone());
         }
         inner.users.insert(id.clone(), user);
