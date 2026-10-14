@@ -12,6 +12,12 @@
 - Real MSRV is 1.88 (current dependency tree); previously declared 1.80 did not build.
 
 ### Added
+- 7 new providers: Twitch, Slack, Spotify, Reddit, Bitbucket, Mail.ru and Telegram
+  (Login Widget, verified with `telegram::verify_login`) — 19 in total.
+- `OAuthClient::refresh` for refresh tokens.
+- `Endpoints::microsoft_tenant`, `Endpoints::gitlab` (self-hosted) and
+  `Endpoints::discover` (any OpenID Connect issuer: Keycloak, Auth0, Okta, …).
+- `cookie` feature: `PendingAuth::seal` / `open` (AES-256-GCM) to keep login state in a cookie.
 - `OAuthClient::verify_id_token` for tokens from mobile Google / Apple SDKs.
 - `OAuthClient::revoke` (RFC 7009), required by Apple on account deletion.
 - End-to-end tests for every provider, property tests, rustdoc for the whole public API.

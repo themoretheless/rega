@@ -183,6 +183,11 @@ impl Callback {
         self.params.get(key).map(String::as_str)
     }
 
+    /// All parameters, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.params.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// Parses a raw query string or `application/x-www-form-urlencoded` body.
     pub fn parse(query: &str) -> Self {
         url::form_urlencoded::parse(query.trim_start_matches('?').as_bytes()).collect()
@@ -301,6 +306,29 @@ impl OAuthClient {
         }
     }
 
+    /// Exchanges a refresh token for a new access token.
+    pub async fn refresh(&self, provider: Provider, refresh_token: &str) -> Result<TokenResponse> {
+        let cfg = self.config(provider)?;
+        let secret = cfg.client_secret.resolve(&cfg.client_id)?;
+        let mut form: Vec<(&str, &str)> = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", &cfg.client_id),
+        ];
+        let mut req = self
+            .http
+            .post(&cfg.endpoints.token)
+            .header("Accept", "application/json");
+        if let Some(secret) = &secret {
+            match provider.client_auth() {
+                ClientAuth::Basic => req = req.basic_auth(&cfg.client_id, Some(secret)),
+                ClientAuth::Post => form.push(("client_secret", secret)),
+            }
+        }
+        let body = read_json(req.form(&form).send().await?).await?;
+        Ok(serde_json::from_value(body)?)
+    }
+
     /// Revokes an access or refresh token (RFC 7009). Apple requires this when
     /// a user deletes their account.
     pub async fn revoke(&self, provider: Provider, token: &str, hint: Option<&str>) -> Result<()> {
@@ -342,6 +370,12 @@ impl OAuthClient {
 
     /// Step 1: build the URL to redirect the user to.
     pub fn authorize(&self, provider: Provider) -> Result<AuthorizationRequest> {
+        if provider == Provider::Telegram {
+            return Err(Error::Config(
+                "Telegram uses the Login Widget; verify it with rega::telegram::verify_login"
+                    .into(),
+            ));
+        }
         let cfg = self.config(provider)?;
         let mut url = Url::parse(&cfg.endpoints.authorize)
             .map_err(|e| Error::Config(format!("authorize endpoint: {e}")))?;
@@ -365,6 +399,13 @@ impl OAuthClient {
             }
             if let Some(n) = &nonce {
                 q.append_pair("nonce", n);
+            }
+            if provider == Provider::Twitch {
+                // Twitch only returns these userinfo claims when asked for explicitly.
+                q.append_pair(
+                    "claims",
+                    r#"{"userinfo":{"email":null,"email_verified":null,"picture":null,"preferred_username":null}}"#,
+                );
             }
             if provider == Provider::Apple && !cfg.scopes.is_empty() {
                 // Apple requires form_post whenever name/email scopes are requested.
@@ -520,7 +561,10 @@ mod tests {
     #[test]
     fn authorize_url_for_every_provider() {
         let c = client();
-        for p in Provider::ALL {
+        for p in Provider::ALL
+            .into_iter()
+            .filter(|p| *p != Provider::Telegram)
+        {
             let req = c.authorize(p).unwrap();
             let q: HashMap<_, _> = req.url.query_pairs().into_owned().collect();
             assert_eq!(q["client_id"], "cid", "{p}");

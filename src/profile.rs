@@ -50,6 +50,10 @@ pub(crate) async fn fetch(
     let access = &token.access_token;
 
     let req = match provider {
+        // Mail.ru expects the token as a query parameter.
+        Provider::MailRu => http
+            .get(userinfo)
+            .query(&[("access_token", access.as_str())]),
         Provider::Yandex => http
             .get(userinfo)
             .header("Authorization", format!("OAuth {access}")),
@@ -69,13 +73,17 @@ pub(crate) async fn fetch(
     let profile = async { read_json(req.header("Accept", "application/json").send().await?).await };
 
     match (provider, cfg.endpoints.emails.as_deref()) {
-        (Provider::GitHub, Some(emails_url)) => {
-            // Both GitHub calls only need the token: run them concurrently.
+        (Provider::GitHub | Provider::Bitbucket, Some(emails_url)) => {
+            // Both calls only need the token: run them concurrently.
             let emails =
                 async { read_json(http.get(emails_url).bearer_auth(access).send().await?).await };
             let (profile, emails) = futures_util::future::join(profile, emails).await;
             let mut identity = map_profile(provider, profile?)?;
-            apply_github_emails(&mut identity, &emails?);
+            if provider == Provider::GitHub {
+                apply_github_emails(&mut identity, &emails?);
+            } else {
+                apply_bitbucket_emails(&mut identity, &emails?);
+            }
             Ok(identity)
         }
         _ => map_profile(provider, profile.await?),
@@ -205,6 +213,49 @@ pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {
             s(&p["name"]),
             None,
         ),
+        Provider::Twitch => (
+            id(&p["sub"]),
+            s(&p["email"]),
+            truthy(&p["email_verified"]),
+            s(&p["preferred_username"]),
+            s(&p["picture"]),
+        ),
+        Provider::Slack => (
+            id(&p["sub"]),
+            s(&p["email"]),
+            truthy(&p["email_verified"]),
+            s(&p["name"]),
+            s(&p["picture"]),
+        ),
+        Provider::Spotify => (
+            id(&p["id"]),
+            s(&p["email"]),
+            false,
+            s(&p["display_name"]),
+            s(&p["images"][0]["url"]),
+        ),
+        Provider::Reddit => (id(&p["id"]), None, false, s(&p["name"]), s(&p["icon_img"])),
+        Provider::Bitbucket => (
+            id(&p["uuid"]),
+            None,
+            false,
+            s(&p["display_name"]).or_else(|| s(&p["nickname"])),
+            s(&p["links"]["avatar"]["href"]),
+        ),
+        Provider::MailRu => (
+            id(&p["id"]),
+            s(&p["email"]),
+            false,
+            s(&p["name"]),
+            s(&p["image"]),
+        ),
+        Provider::Telegram => (
+            id(&p["id"]),
+            None,
+            false,
+            join_name(s(&p["first_name"]), s(&p["last_name"])).or_else(|| s(&p["username"])),
+            s(&p["photo_url"]),
+        ),
         Provider::Apple => return map_apple(p, None),
     };
 
@@ -247,6 +298,22 @@ pub fn map_apple(claims: Value, user: Option<Value>) -> Result<ExternalIdentity>
         avatar_url: None,
         raw,
     })
+}
+
+/// Sets the primary confirmed email from Bitbucket `/2.0/user/emails`.
+pub fn apply_bitbucket_emails(identity: &mut ExternalIdentity, emails: &Value) {
+    let list = emails["values"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let pick = list
+        .iter()
+        .find(|e| truthy(&e["is_primary"]) && truthy(&e["is_confirmed"]))
+        .or_else(|| list.iter().find(|e| truthy(&e["is_confirmed"])));
+    if let Some(email) = pick.and_then(|e| e["email"].as_str()) {
+        identity.email = Some(normalize_email(email));
+        identity.email_verified = true;
+    }
 }
 
 /// Replaces the GitHub email with the primary verified one from `/user/emails`.

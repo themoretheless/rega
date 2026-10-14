@@ -30,6 +30,21 @@ pub enum Provider {
     GitLab,
     /// Login with Amazon.
     Amazon,
+    /// Twitch (OpenID Connect).
+    Twitch,
+    /// Slack ("Sign in with Slack", OpenID Connect).
+    Slack,
+    /// Spotify.
+    Spotify,
+    /// Reddit.
+    Reddit,
+    /// Bitbucket Cloud.
+    Bitbucket,
+    /// Mail.ru (VK Group) OAuth.
+    MailRu,
+    /// Telegram Login Widget. Not an OAuth provider: verify the widget data
+    /// with [`telegram::verify_login`](crate::telegram::verify_login).
+    Telegram,
 }
 
 /// How the client authenticates at the token endpoint.
@@ -59,9 +74,61 @@ pub struct Endpoints {
     pub revoke: Option<String>,
 }
 
+impl Endpoints {
+    /// Microsoft endpoints restricted to one tenant (`organizations`,
+    /// `consumers`, a tenant id or domain).
+    pub fn microsoft_tenant(tenant: &str) -> Self {
+        let base = format!("https://login.microsoftonline.com/{tenant}");
+        Self {
+            authorize: format!("{base}/oauth2/v2.0/authorize"),
+            token: format!("{base}/oauth2/v2.0/token"),
+            jwks: Some(format!("{base}/discovery/v2.0/keys")),
+            ..Provider::Microsoft.endpoints()
+        }
+    }
+
+    /// Endpoints of a self-hosted GitLab instance, e.g. `https://gitlab.example.com`.
+    pub fn gitlab(base_url: &str) -> Self {
+        let base = base_url.trim_end_matches('/');
+        Self {
+            authorize: format!("{base}/oauth/authorize"),
+            token: format!("{base}/oauth/token"),
+            userinfo: Some(format!("{base}/oauth/userinfo")),
+            emails: None,
+            jwks: Some(format!("{base}/oauth/discovery/keys")),
+            revoke: Some(format!("{base}/oauth/revoke")),
+        }
+    }
+
+    /// Loads endpoints from an OpenID Connect discovery document
+    /// (`{issuer}/.well-known/openid-configuration`): Keycloak, Auth0, Okta,
+    /// Zitadel, self-hosted GitLab, etc.
+    pub async fn discover(http: &reqwest::Client, issuer: &str) -> crate::Result<Self> {
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
+        let doc = crate::client::read_json(http.get(url).send().await?).await?;
+        let field = |name: &str| doc[name].as_str().map(str::to_owned);
+        let required = |name: &str| {
+            field(name).ok_or_else(|| {
+                crate::Error::InvalidResponse(format!("discovery document has no `{name}`"))
+            })
+        };
+        Ok(Self {
+            authorize: required("authorization_endpoint")?,
+            token: required("token_endpoint")?,
+            userinfo: field("userinfo_endpoint"),
+            emails: None,
+            jwks: field("jwks_uri"),
+            revoke: field("revocation_endpoint"),
+        })
+    }
+}
+
 impl Provider {
     /// Every supported provider.
-    pub const ALL: [Provider; 12] = [
+    pub const ALL: [Provider; 19] = [
         Provider::Google,
         Provider::Apple,
         Provider::Microsoft,
@@ -74,6 +141,13 @@ impl Provider {
         Provider::Vk,
         Provider::GitLab,
         Provider::Amazon,
+        Provider::Twitch,
+        Provider::Slack,
+        Provider::Spotify,
+        Provider::Reddit,
+        Provider::Bitbucket,
+        Provider::MailRu,
+        Provider::Telegram,
     ];
 
     /// Stable lower-case identifier, e.g. `"google"`.
@@ -91,6 +165,13 @@ impl Provider {
             Provider::Vk => "vk",
             Provider::GitLab => "gitlab",
             Provider::Amazon => "amazon",
+            Provider::Twitch => "twitch",
+            Provider::Slack => "slack",
+            Provider::Spotify => "spotify",
+            Provider::Reddit => "reddit",
+            Provider::Bitbucket => "bitbucket",
+            Provider::MailRu => "mailru",
+            Provider::Telegram => "telegram",
         }
     }
 
@@ -171,6 +252,43 @@ impl Provider {
                 Some("https://api.amazon.com/user/profile"),
                 None,
             ),
+            Provider::Twitch => (
+                "https://id.twitch.tv/oauth2/authorize",
+                "https://id.twitch.tv/oauth2/token",
+                Some("https://id.twitch.tv/oauth2/userinfo"),
+                None,
+            ),
+            Provider::Slack => (
+                "https://slack.com/openid/connect/authorize",
+                "https://slack.com/api/openid.connect.token",
+                Some("https://slack.com/api/openid.connect.userInfo"),
+                None,
+            ),
+            Provider::Spotify => (
+                "https://accounts.spotify.com/authorize",
+                "https://accounts.spotify.com/api/token",
+                Some("https://api.spotify.com/v1/me"),
+                None,
+            ),
+            Provider::Reddit => (
+                "https://www.reddit.com/api/v1/authorize",
+                "https://www.reddit.com/api/v1/access_token",
+                Some("https://oauth.reddit.com/api/v1/me"),
+                None,
+            ),
+            Provider::Bitbucket => (
+                "https://bitbucket.org/site/oauth2/authorize",
+                "https://bitbucket.org/site/oauth2/access_token",
+                Some("https://api.bitbucket.org/2.0/user"),
+                Some("https://api.bitbucket.org/2.0/user/emails"),
+            ),
+            Provider::MailRu => (
+                "https://oauth.mail.ru/login",
+                "https://oauth.mail.ru/token",
+                Some("https://oauth.mail.ru/userinfo"),
+                None,
+            ),
+            Provider::Telegram => ("https://oauth.telegram.org/auth", "", None, None),
         };
         Endpoints {
             authorize: authorize.into(),
@@ -190,6 +308,8 @@ impl Provider {
                 Some("https://login.microsoftonline.com/common/discovery/v2.0/keys")
             }
             Provider::GitLab => Some("https://gitlab.com/oauth/discovery/keys"),
+            Provider::Twitch => Some("https://id.twitch.tv/oauth2/keys"),
+            Provider::Slack => Some("https://slack.com/openid/connect/keys"),
             _ => None,
         }
     }
@@ -201,6 +321,9 @@ impl Provider {
             Provider::X => Some("https://api.x.com/2/oauth2/revoke"),
             Provider::Discord => Some("https://discord.com/api/oauth2/token/revoke"),
             Provider::GitLab => Some("https://gitlab.com/oauth/revoke"),
+            Provider::Twitch => Some("https://id.twitch.tv/oauth2/revoke"),
+            Provider::Spotify | Provider::Slack | Provider::Bitbucket | Provider::MailRu => None,
+            Provider::Reddit => Some("https://www.reddit.com/api/v1/revoke_token"),
             _ => None,
         }
     }
@@ -211,6 +334,8 @@ impl Provider {
         match self {
             Provider::Google => &["https://accounts.google.com", "accounts.google.com"],
             Provider::Apple => &["https://appleid.apple.com"],
+            Provider::Twitch => &["https://id.twitch.tv/oauth2"],
+            Provider::Slack => &["https://slack.com"],
             _ => &[],
         }
     }
@@ -229,6 +354,13 @@ impl Provider {
             Provider::Yandex => &["login:email", "login:info", "login:avatar"],
             Provider::Vk => &["vkid.personal_info", "email"],
             Provider::Amazon => &["profile"],
+            Provider::Twitch => &["openid", "user:read:email"],
+            Provider::Slack => &["openid", "email", "profile"],
+            Provider::Spotify => &["user-read-email", "user-read-private"],
+            Provider::Reddit => &["identity"],
+            Provider::Bitbucket => &["account", "email"],
+            Provider::MailRu => &["userinfo"],
+            Provider::Telegram => &[],
         }
     }
 
@@ -242,7 +374,11 @@ impl Provider {
     /// How the client authenticates at the token endpoint.
     pub fn client_auth(self) -> ClientAuth {
         match self {
-            Provider::X | Provider::Discord => ClientAuth::Basic,
+            Provider::X
+            | Provider::Discord
+            | Provider::Spotify
+            | Provider::Reddit
+            | Provider::Bitbucket => ClientAuth::Basic,
             _ => ClientAuth::Post,
         }
     }
@@ -252,7 +388,15 @@ impl Provider {
     pub fn supports_pkce(self) -> bool {
         !matches!(
             self,
-            Provider::Apple | Provider::LinkedIn | Provider::Discord
+            Provider::Apple
+                | Provider::LinkedIn
+                | Provider::Discord
+                | Provider::Twitch
+                | Provider::Slack
+                | Provider::Reddit
+                | Provider::Bitbucket
+                | Provider::MailRu
+                | Provider::Telegram
         )
     }
 
@@ -260,7 +404,12 @@ impl Provider {
     pub(crate) fn uses_nonce(self) -> bool {
         matches!(
             self,
-            Provider::Google | Provider::Apple | Provider::Microsoft | Provider::GitLab
+            Provider::Google
+                | Provider::Apple
+                | Provider::Microsoft
+                | Provider::GitLab
+                | Provider::Twitch
+                | Provider::Slack
         )
     }
 }

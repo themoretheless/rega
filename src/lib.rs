@@ -41,12 +41,15 @@
 mod account;
 mod apple;
 mod client;
+#[cfg(feature = "cookie")]
+mod cookie;
 mod error;
 mod identity;
 mod jwks;
 mod pkce;
 pub mod profile;
 mod provider;
+pub mod telegram;
 
 pub use account::{
     AccountError, AccountStore, Accounts, ExternalLogin, InMemoryStore, LinkPolicy, NewUser,
