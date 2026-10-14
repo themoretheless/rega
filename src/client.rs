@@ -232,6 +232,9 @@ pub struct TokenResponse {
 pub struct OAuthClient {
     http: reqwest::Client,
     providers: HashMap<Provider, ProviderConfig>,
+    /// Authorization URL with every per-registration parameter already
+    /// encoded; `authorize` only appends the per-request ones.
+    base_urls: HashMap<Provider, std::result::Result<Url, String>>,
     jwks: HashMap<Provider, Arc<Jwks>>,
 }
 
@@ -259,6 +262,7 @@ impl OAuthClient {
         Self {
             http,
             providers: HashMap::new(),
+            base_urls: HashMap::new(),
             jwks: HashMap::new(),
         }
     }
@@ -274,6 +278,8 @@ impl OAuthClient {
                 self.jwks.remove(&config.provider);
             }
         }
+        self.base_urls
+            .insert(config.provider, base_authorize_url(&config));
         self.providers.insert(config.provider, config);
         self
     }
@@ -376,9 +382,11 @@ impl OAuthClient {
                     .into(),
             ));
         }
-        let cfg = self.config(provider)?;
-        let mut url = Url::parse(&cfg.endpoints.authorize)
-            .map_err(|e| Error::Config(format!("authorize endpoint: {e}")))?;
+        let mut url = match self.base_urls.get(&provider) {
+            Some(Ok(url)) => url.clone(),
+            Some(Err(e)) => return Err(Error::Config(format!("authorize endpoint: {e}"))),
+            None => return Err(Error::NotConfigured(provider)),
+        };
 
         let [state, nonce, code_verifier] = pkce::random_tokens::<3>();
         let nonce = provider.uses_nonce().then_some(nonce);
@@ -386,33 +394,13 @@ impl OAuthClient {
 
         {
             let mut q = url.query_pairs_mut();
-            q.append_pair("response_type", "code")
-                .append_pair("client_id", &cfg.client_id)
-                .append_pair("redirect_uri", &cfg.redirect_uri)
-                .append_pair("state", &state);
-            if !cfg.scopes.is_empty() {
-                q.append_pair("scope", &cfg.scopes.join(provider.scope_separator()));
-            }
+            q.append_pair("state", &state);
             if let Some(v) = &code_verifier {
                 q.append_pair("code_challenge", &pkce::challenge(v))
                     .append_pair("code_challenge_method", "S256");
             }
             if let Some(n) = &nonce {
                 q.append_pair("nonce", n);
-            }
-            if provider == Provider::Twitch {
-                // Twitch only returns these userinfo claims when asked for explicitly.
-                q.append_pair(
-                    "claims",
-                    r#"{"userinfo":{"email":null,"email_verified":null,"picture":null,"preferred_username":null}}"#,
-                );
-            }
-            if provider == Provider::Apple && !cfg.scopes.is_empty() {
-                // Apple requires form_post whenever name/email scopes are requested.
-                q.append_pair("response_mode", "form_post");
-            }
-            for (k, v) in &cfg.authorize_params {
-                q.append_pair(k, v);
             }
         }
 
@@ -499,6 +487,36 @@ impl OAuthClient {
         let body = read_json(req.form(&form).send().await?).await?;
         Ok(serde_json::from_value(body)?)
     }
+}
+
+/// Authorization URL with the parameters that never change per request.
+fn base_authorize_url(cfg: &ProviderConfig) -> std::result::Result<Url, String> {
+    let provider = cfg.provider;
+    let mut url = Url::parse(&cfg.endpoints.authorize).map_err(|e| e.to_string())?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("response_type", "code")
+            .append_pair("client_id", &cfg.client_id)
+            .append_pair("redirect_uri", &cfg.redirect_uri);
+        if !cfg.scopes.is_empty() {
+            q.append_pair("scope", &cfg.scopes.join(provider.scope_separator()));
+        }
+        if provider == Provider::Twitch {
+            // Twitch only returns these userinfo claims when asked for explicitly.
+            q.append_pair(
+                "claims",
+                r#"{"userinfo":{"email":null,"email_verified":null,"picture":null,"preferred_username":null}}"#,
+            );
+        }
+        if provider == Provider::Apple && !cfg.scopes.is_empty() {
+            // Apple requires form_post whenever name/email scopes are requested.
+            q.append_pair("response_mode", "form_post");
+        }
+        for (k, v) in &cfg.authorize_params {
+            q.append_pair(k, v);
+        }
+    }
+    Ok(url)
 }
 
 /// Reads a JSON body and maps OAuth error payloads (including GitHub's
