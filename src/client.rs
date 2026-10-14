@@ -3,12 +3,19 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use std::sync::Arc;
+
 use crate::apple::{self, AppleKey, AppleSigner};
+use crate::jwks::Jwks;
 use crate::provider::{ClientAuth, Endpoints};
 use crate::{pkce, profile, Error, ExternalIdentity, Provider, Result};
 
 /// How long a [`PendingAuth`] stays valid.
 const PENDING_TTL_SECS: u64 = 15 * 60;
+/// Upper bound for any provider response body.
+const MAX_RESPONSE_BYTES: usize = 1 << 20;
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Client credential used at the token endpoint.
 #[derive(Debug, Clone)]
@@ -22,6 +29,13 @@ pub enum ClientSecret {
 }
 
 impl ClientSecret {
+    pub(crate) fn static_secret(&self) -> Option<&str> {
+        match self {
+            ClientSecret::Static(s) => Some(s),
+            _ => None,
+        }
+    }
+
     fn resolve(&self, client_id: &str) -> Result<Option<String>> {
         match self {
             ClientSecret::None => Ok(None),
@@ -42,6 +56,12 @@ pub struct ProviderConfig {
     pub endpoints: Endpoints,
     /// Extra query parameters for the authorization URL (`prompt`, `hd`, ...).
     pub authorize_params: Vec<(String, String)>,
+    /// Verify `id_token` signatures against the provider's JWKS during the
+    /// code flow. Off by default: the token comes straight from the token
+    /// endpoint over TLS (OIDC Core §3.1.3.7), and verification costs a
+    /// (cached) key-set download. Tokens passed to
+    /// [`OAuthClient::verify_id_token`] are always verified.
+    pub verify_signatures: bool,
 }
 
 impl ProviderConfig {
@@ -68,6 +88,7 @@ impl ProviderConfig {
                 .collect(),
             endpoints: provider.endpoints(),
             authorize_params: Vec::new(),
+            verify_signatures: false,
         }
     }
 
@@ -93,6 +114,12 @@ impl ProviderConfig {
 
     pub fn with_endpoints(mut self, endpoints: Endpoints) -> Self {
         self.endpoints = endpoints;
+        self
+    }
+
+    /// Enables JWKS signature verification of `id_token` in the code flow.
+    pub fn with_signature_verification(mut self) -> Self {
+        self.verify_signatures = true;
         self
     }
 
@@ -175,6 +202,7 @@ pub struct TokenResponse {
 pub struct OAuthClient {
     http: reqwest::Client,
     providers: HashMap<Provider, ProviderConfig>,
+    jwks: HashMap<Provider, Arc<Jwks>>,
 }
 
 impl Default for OAuthClient {
@@ -188,6 +216,8 @@ impl OAuthClient {
         let http = reqwest::Client::builder()
             .user_agent(concat!("rega/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("default HTTP client");
         Self::with_http_client(http)
@@ -197,12 +227,77 @@ impl OAuthClient {
         Self {
             http,
             providers: HashMap::new(),
+            jwks: HashMap::new(),
         }
     }
 
     pub fn register(mut self, config: ProviderConfig) -> Self {
+        match &config.endpoints.jwks {
+            Some(url) => {
+                self.jwks
+                    .insert(config.provider, Arc::new(Jwks::new(url.clone())));
+            }
+            None => {
+                self.jwks.remove(&config.provider);
+            }
+        }
         self.providers.insert(config.provider, config);
         self
+    }
+
+    /// Verifies an `id_token` obtained outside the redirect flow — e.g. from the
+    /// Google Sign-In or Sign in with Apple SDK in a mobile app — and returns the
+    /// identity. The signature is always checked against the provider's JWKS.
+    /// `audience` defaults to the configured `client_id`; mobile apps usually
+    /// have their own (iOS bundle id / Android client id).
+    pub async fn verify_id_token(
+        &self,
+        provider: Provider,
+        id_token: &str,
+        audience: Option<&str>,
+        nonce: Option<&str>,
+    ) -> Result<ExternalIdentity> {
+        let cfg = self.config(provider)?;
+        let jwks = self.jwks.get(&provider).ok_or_else(|| {
+            Error::Config(format!(
+                "{provider}: no JWKS endpoint, id_token login is unsupported"
+            ))
+        })?;
+        let aud = audience.unwrap_or(&cfg.client_id);
+        let claims = jwks
+            .verify(&self.http, provider, id_token, aud, nonce)
+            .await?;
+        match provider {
+            Provider::Apple => profile::map_apple(claims, None),
+            _ => profile::map_profile(provider, claims),
+        }
+    }
+
+    /// Revokes an access or refresh token (RFC 7009). Apple requires this when
+    /// a user deletes their account.
+    pub async fn revoke(&self, provider: Provider, token: &str, hint: Option<&str>) -> Result<()> {
+        let cfg = self.config(provider)?;
+        let url =
+            cfg.endpoints.revoke.as_deref().ok_or_else(|| {
+                Error::Config(format!("{provider}: token revocation is unsupported"))
+            })?;
+        let secret = cfg.client_secret.resolve(&cfg.client_id)?;
+        let mut form: Vec<(&str, &str)> = vec![("token", token), ("client_id", &cfg.client_id)];
+        if let Some(hint) = hint {
+            form.push(("token_type_hint", hint));
+        }
+        let mut req = self.http.post(url);
+        if let Some(secret) = &secret {
+            match provider.client_auth() {
+                ClientAuth::Basic => req = req.basic_auth(&cfg.client_id, Some(secret)),
+                ClientAuth::Post => form.push(("client_secret", secret)),
+            }
+        }
+        let resp = req.form(&form).send().await?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        read_json(resp).await.map(drop)
     }
 
     pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {
@@ -279,11 +374,11 @@ impl OAuthClient {
             });
         }
         let state = callback.get("state").unwrap_or_default();
-        if !pkce::constant_time_eq(state, &pending.state) {
+        if pending.state.is_empty() || !pkce::constant_time_eq(state, &pending.state) {
             return Err(Error::StateMismatch);
         }
         if apple::now().saturating_sub(pending.created_at) > PENDING_TTL_SECS {
-            return Err(Error::StateMismatch);
+            return Err(Error::Expired);
         }
         let code = callback
             .get("code")
@@ -291,7 +386,8 @@ impl OAuthClient {
             .ok_or(Error::MissingCode)?;
         let cfg = self.config(pending.provider)?;
         let token = self.exchange_code(cfg, code, callback, pending).await?;
-        profile::fetch(&self.http, cfg, &token, callback, pending).await
+        let jwks = self.jwks.get(&pending.provider).map(Arc::as_ref);
+        profile::fetch(&self.http, cfg, &token, callback, pending, jwks).await
     }
 
     async fn exchange_code(
@@ -301,29 +397,28 @@ impl OAuthClient {
         callback: &Callback,
         pending: &PendingAuth,
     ) -> Result<TokenResponse> {
-        let mut form: Vec<(&str, String)> = vec![
-            ("grant_type", "authorization_code".into()),
-            ("code", code.into()),
-            ("redirect_uri", cfg.redirect_uri.clone()),
-            ("client_id", cfg.client_id.clone()),
-        ];
+        let secret = cfg.client_secret.resolve(&cfg.client_id)?;
+        let mut form: Vec<(&str, &str)> = Vec::with_capacity(8);
+        form.extend([
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", cfg.redirect_uri.as_str()),
+            ("client_id", cfg.client_id.as_str()),
+        ]);
         if let Some(v) = &pending.code_verifier {
-            form.push(("code_verifier", v.clone()));
+            form.push(("code_verifier", v));
         }
         if cfg.provider == Provider::Vk {
             // VK ID binds the code to the device id returned in the callback.
-            form.push((
-                "device_id",
-                callback.get("device_id").unwrap_or_default().into(),
-            ));
-            form.push(("state", pending.state.clone()));
+            form.push(("device_id", callback.get("device_id").unwrap_or_default()));
+            form.push(("state", &pending.state));
         }
 
         let mut req = self
             .http
             .post(&cfg.endpoints.token)
             .header("Accept", "application/json");
-        if let Some(secret) = cfg.client_secret.resolve(&cfg.client_id)? {
+        if let Some(secret) = &secret {
             match cfg.provider.client_auth() {
                 ClientAuth::Basic => req = req.basic_auth(&cfg.client_id, Some(secret)),
                 ClientAuth::Post => form.push(("client_secret", secret)),
@@ -337,14 +432,28 @@ impl OAuthClient {
 
 /// Reads a JSON body and maps OAuth error payloads (including GitHub's
 /// `200 OK` + `{"error": ...}`) to [`Error::Provider`].
-pub(crate) async fn read_json(resp: reqwest::Response) -> Result<serde_json::Value> {
+pub(crate) async fn read_json(mut resp: reqwest::Response) -> Result<serde_json::Value> {
     let status = resp.status();
-    let text = resp.text().await?;
-    let json: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
-        Error::InvalidResponse(format!(
-            "HTTP {status}: {}",
-            text.chars().take(200).collect::<String>()
-        ))
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(Error::InvalidResponse(format!(
+            "HTTP {status}: response too large"
+        )));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(Error::InvalidResponse(format!(
+                "HTTP {status}: response too large"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let json: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+        let head = String::from_utf8_lossy(&body[..body.len().min(200)]);
+        Error::InvalidResponse(format!("HTTP {status}: {head}"))
     })?;
     if let Some(error) = json.get("error") {
         let error = match error {

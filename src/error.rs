@@ -12,6 +12,8 @@ pub enum Error {
     Provider { error: String, description: String },
     #[error("state parameter does not match the pending authorization")]
     StateMismatch,
+    #[error("authorization attempt expired; start the login again")]
+    Expired,
     #[error("callback does not contain an authorization code")]
     MissingCode,
     #[error("invalid response from provider: {0}")]

@@ -4,6 +4,7 @@
 use serde_json::Value;
 
 use crate::client::{read_json, Callback, PendingAuth, ProviderConfig, TokenResponse};
+use crate::jwks::Jwks;
 use crate::{apple, Error, ExternalIdentity, Provider, Result};
 
 pub(crate) async fn fetch(
@@ -12,6 +13,7 @@ pub(crate) async fn fetch(
     token: &TokenResponse,
     callback: &Callback,
     pending: &PendingAuth,
+    jwks: Option<&Jwks>,
 ) -> Result<ExternalIdentity> {
     let provider = cfg.provider;
     if provider == Provider::Apple {
@@ -19,12 +21,7 @@ pub(crate) async fn fetch(
             .id_token
             .as_deref()
             .ok_or_else(|| Error::InvalidResponse("Apple did not return an id_token".into()))?;
-        let claims = apple::id_token_claims(
-            id_token,
-            &[apple::ISSUER],
-            &cfg.client_id,
-            pending.nonce.as_deref(),
-        )?;
+        let claims = id_token_claims(http, cfg, jwks, id_token, pending.nonce.as_deref()).await?;
         // Apple sends the user's name only once, on the first authorization.
         let user = callback
             .get("user")
@@ -37,12 +34,7 @@ pub(crate) async fn fetch(
     // the userinfo round-trip. Microsoft/GitLab issuers depend on the tenant or
     // host, so only audience/expiry/nonce are enforced for them.
     if let (Some(nonce), Some(id_token)) = (pending.nonce.as_deref(), token.id_token.as_deref()) {
-        let issuers = if provider == Provider::Google {
-            GOOGLE_ISSUERS
-        } else {
-            &[]
-        };
-        let claims = apple::id_token_claims(id_token, issuers, &cfg.client_id, Some(nonce))?;
+        let claims = id_token_claims(http, cfg, jwks, id_token, Some(nonce)).await?;
         // Google always includes the profile; Microsoft and GitLab only when the
         // optional `email` claim is configured, otherwise fall back to userinfo.
         if provider == Provider::Google || claims["email"].is_string() {
@@ -65,6 +57,13 @@ pub(crate) async fn fetch(
             ("client_id", cfg.client_id.as_str()),
             ("access_token", access.as_str()),
         ]),
+        Provider::Facebook => {
+            let mut req = http.get(userinfo).bearer_auth(access);
+            if let Some(secret) = cfg.client_secret.static_secret() {
+                req = req.query(&[("appsecret_proof", appsecret_proof(secret, access))]);
+            }
+            req
+        }
         _ => http.get(userinfo).bearer_auth(access),
     };
     let profile = async { read_json(req.header("Accept", "application/json").send().await?).await };
@@ -83,7 +82,25 @@ pub(crate) async fn fetch(
     }
 }
 
-const GOOGLE_ISSUERS: &[&str] = &["https://accounts.google.com", "accounts.google.com"];
+/// Validates `id_token` claims; additionally verifies the signature against the
+/// provider's JWKS when [`ProviderConfig::verify_signatures`] is enabled.
+async fn id_token_claims(
+    http: &reqwest::Client,
+    cfg: &ProviderConfig,
+    jwks: Option<&Jwks>,
+    id_token: &str,
+    nonce: Option<&str>,
+) -> Result<Value> {
+    match jwks.filter(|_| cfg.verify_signatures) {
+        Some(jwks) => {
+            jwks.verify(http, cfg.provider, id_token, &cfg.client_id, nonce)
+                .await
+        }
+        // Microsoft/GitLab issuers depend on the tenant or host, so only
+        // audience/expiry/nonce are enforced for them.
+        None => apple::id_token_claims(id_token, cfg.provider.issuers(), &cfg.client_id, nonce),
+    }
+}
 
 /// Maps a provider's userinfo payload to an [`ExternalIdentity`].
 pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {
@@ -137,9 +154,13 @@ pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {
         }
         Provider::Discord => {
             let avatar = match (s(&p["id"]), s(&p["avatar"])) {
-                (Some(uid), Some(hash)) => Some(format!(
-                    "https://cdn.discordapp.com/avatars/{uid}/{hash}.png"
-                )),
+                (Some(uid), Some(hash)) => {
+                    // Hashes of animated avatars start with `a_`.
+                    let ext = if hash.starts_with("a_") { "gif" } else { "png" };
+                    Some(format!(
+                        "https://cdn.discordapp.com/avatars/{uid}/{hash}.{ext}"
+                    ))
+                }
                 _ => None,
             };
             (
@@ -193,7 +214,7 @@ pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {
         provider,
         subject,
         email_verified: email_verified && email.is_some(),
-        email: email.map(|e| e.to_lowercase()),
+        email: email.map(|e| normalize_email(&e)),
         name,
         avatar_url: avatar,
         raw: p,
@@ -206,7 +227,7 @@ pub fn map_apple(claims: Value, user: Option<Value>) -> Result<ExternalIdentity>
         .as_str()
         .ok_or_else(|| Error::InvalidResponse("apple: id_token has no sub".into()))?
         .to_owned();
-    let email = claims["email"].as_str().map(str::to_lowercase);
+    let email = claims["email"].as_str().map(normalize_email);
     let name = user.as_ref().and_then(|u| {
         join_name(
             u["name"]["firstName"].as_str().map(Into::into),
@@ -236,9 +257,28 @@ pub fn apply_github_emails(identity: &mut ExternalIdentity, emails: &Value) {
         .find(|e| truthy(&e["primary"]) && truthy(&e["verified"]))
         .or_else(|| list.iter().find(|e| truthy(&e["verified"])));
     if let Some(email) = pick.and_then(|e| e["email"].as_str()) {
-        identity.email = Some(email.to_lowercase());
+        identity.email = Some(normalize_email(email));
         identity.email_verified = true;
     }
+}
+
+/// Trimmed, lower-cased email used for comparison and storage.
+pub fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// `appsecret_proof` = hex(HMAC-SHA256(key = app secret, msg = access token)),
+/// required by Facebook apps with "Require App Secret" enabled.
+fn appsecret_proof(secret: &str, access_token: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+    mac.update(access_token.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Apple and some OIDC providers encode booleans as strings.
@@ -353,5 +393,37 @@ mod tests {
     #[test]
     fn missing_subject_is_error() {
         assert!(map_profile(Provider::Amazon, json!({"email":"a@b"})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fixes_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn discord_animated_avatar_is_gif() {
+        let d = map_profile(Provider::Discord, json!({"id":"1","avatar":"a_abc"})).unwrap();
+        assert!(d.avatar_url.unwrap().ends_with("/a_abc.gif"));
+    }
+
+    #[test]
+    fn appsecret_proof_matches_reference() {
+        // echo -n token | openssl dgst -sha256 -hmac secret
+        assert_eq!(
+            appsecret_proof("secret", "token"),
+            "e941110e3d2bfe82621f0e3e1434730d7305d106c5f68c87165d0b27a4611a4a"
+        );
+    }
+
+    #[test]
+    fn email_is_trimmed_and_lowercased() {
+        let i = map_profile(
+            Provider::Google,
+            json!({"sub":"1","email":"  A@B.C ","email_verified":true}),
+        )
+        .unwrap();
+        assert_eq!(i.email.as_deref(), Some("a@b.c"));
     }
 }

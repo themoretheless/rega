@@ -17,6 +17,7 @@ mod apple;
 mod client;
 mod error;
 mod identity;
+mod jwks;
 mod pkce;
 pub mod profile;
 mod provider;

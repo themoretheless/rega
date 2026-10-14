@@ -39,6 +39,10 @@ pub struct Endpoints {
     pub userinfo: Option<String>,
     /// Secondary endpoint (GitHub: `/user/emails`).
     pub emails: Option<String>,
+    /// JSON Web Key Set used to verify `id_token` signatures (OIDC providers).
+    pub jwks: Option<String>,
+    /// Token revocation endpoint (RFC 7009).
+    pub revoke: Option<String>,
 }
 
 impl Provider {
@@ -156,6 +160,41 @@ impl Provider {
             token: token.into(),
             userinfo: userinfo.map(Into::into),
             emails: emails.map(Into::into),
+            jwks: self.jwks_uri().map(Into::into),
+            revoke: self.revoke_uri().map(Into::into),
+        }
+    }
+
+    fn jwks_uri(self) -> Option<&'static str> {
+        match self {
+            Provider::Google => Some("https://www.googleapis.com/oauth2/v3/certs"),
+            Provider::Apple => Some("https://appleid.apple.com/auth/keys"),
+            Provider::Microsoft => {
+                Some("https://login.microsoftonline.com/common/discovery/v2.0/keys")
+            }
+            Provider::GitLab => Some("https://gitlab.com/oauth/discovery/keys"),
+            _ => None,
+        }
+    }
+
+    fn revoke_uri(self) -> Option<&'static str> {
+        match self {
+            Provider::Google => Some("https://oauth2.googleapis.com/revoke"),
+            Provider::Apple => Some("https://appleid.apple.com/auth/revoke"),
+            Provider::X => Some("https://api.x.com/2/oauth2/revoke"),
+            Provider::Discord => Some("https://discord.com/api/oauth2/token/revoke"),
+            Provider::GitLab => Some("https://gitlab.com/oauth/revoke"),
+            _ => None,
+        }
+    }
+
+    /// Accepted `iss` values of the provider's `id_token`. Empty when the issuer
+    /// is tenant/host specific (Microsoft is checked against the `tid` claim).
+    pub(crate) fn issuers(self) -> &'static [&'static str] {
+        match self {
+            Provider::Google => &["https://accounts.google.com", "accounts.google.com"],
+            Provider::Apple => &["https://appleid.apple.com"],
+            _ => &[],
         }
     }
 

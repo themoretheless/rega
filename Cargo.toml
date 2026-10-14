@@ -13,6 +13,7 @@ categories = ["authentication", "web-programming"]
 async-trait = "0.1"
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false }
+hmac = "0.12"
 jsonwebtoken = "9.3"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

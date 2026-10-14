@@ -176,7 +176,8 @@ pub(crate) fn id_token_claims(
     Ok(claims)
 }
 
-pub(crate) const ISSUER: &str = APPLE_ISSUER;
+#[cfg(test)]
+const ISSUER: &str = APPLE_ISSUER;
 
 #[cfg(test)]
 mod tests {

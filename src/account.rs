@@ -250,7 +250,7 @@ impl AccountStore for InMemoryStore {
         Ok(self
             .read()
             .verified_emails
-            .get(&email.to_lowercase())
+            .get(&crate::profile::normalize_email(email))
             .cloned())
     }
 
@@ -260,7 +260,7 @@ impl AccountStore for InMemoryStore {
         if let (true, Some(email)) = (user.email_verified, &user.email) {
             inner
                 .verified_emails
-                .entry(email.to_lowercase())
+                .entry(crate::profile::normalize_email(email))
                 .or_insert_with(|| id.clone());
         }
         inner.users.insert(id.clone(), user);
