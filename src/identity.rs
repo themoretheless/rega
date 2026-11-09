@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::Provider;
+use crate::ProviderId;
 
 /// Normalized user profile returned by any provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExternalIdentity {
     /// Provider that authenticated the user.
-    pub provider: Provider,
+    pub provider: ProviderId,
     /// Stable, provider-unique user id. Use it (not the email) as the login key.
     pub subject: String,
     /// Email address, trimmed and lower-cased.

@@ -2,6 +2,7 @@
 
 use crate::apple::{AppleKey, AppleSigner};
 use crate::provider::Endpoints;
+use crate::spec::{ProviderId, ProviderSpec};
 use crate::{Provider, Result};
 
 /// Client credential used at the token endpoint. `Debug` never prints the secret.
@@ -49,39 +50,50 @@ impl ClientSecret {
 /// Application registration at a provider.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
-    /// Provider this registration belongs to.
-    pub provider: Provider,
+    /// What the provider is and how it behaves. Its `endpoints` are what
+    /// [`with_endpoints`](Self::with_endpoints) replaces.
+    pub spec: ProviderSpec,
     /// OAuth client id.
     pub client_id: String,
     /// Credential for the token endpoint.
     pub client_secret: ClientSecret,
     /// Redirect URI registered at the provider.
     pub redirect_uri: String,
-    /// Requested scopes; defaults to [`Provider::default_scopes`].
+    /// Requested scopes; defaults to the spec's `default_scopes`.
     pub scopes: Vec<String>,
-    /// Provider endpoints; defaults to [`Provider::endpoints`].
-    pub endpoints: Endpoints,
     /// Extra query parameters for the authorization URL (`prompt`, `hd`, ...).
     pub authorize_params: Vec<(String, String)>,
     /// Verify `id_token` signatures against the provider's JWKS during the
     /// code flow. Off by default: the token comes straight from the token
     /// endpoint over TLS (OIDC Core §3.1.3.7), and verification costs a
     /// (cached) key-set download. Tokens passed to
-    /// [`OAuthClient::verify_id_token`] are always verified.
+    /// [`OAuthClient::verify_id_token`](crate::OAuthClient::verify_id_token)
+    /// are always verified.
     pub verify_signatures: bool,
 }
 
 impl ProviderConfig {
-    /// Registration with default scopes and endpoints. An empty secret makes a public (PKCE-only) client.
+    /// Registration of a built-in provider with its default scopes and
+    /// endpoints. An empty secret makes a public (PKCE-only) client.
     pub fn new(
         provider: Provider,
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
+        Self::custom(provider.spec(), client_id, client_secret, redirect_uri)
+    }
+
+    /// Registration of any provider described by a [`ProviderSpec`] — your
+    /// own OpenID Connect server, or a built-in spec you adjusted.
+    pub fn custom(
+        spec: ProviderSpec,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+        redirect_uri: impl Into<String>,
+    ) -> Self {
         let secret = client_secret.into();
         Self {
-            provider,
             client_id: client_id.into(),
             client_secret: if secret.is_empty() {
                 ClientSecret::None
@@ -89,14 +101,10 @@ impl ProviderConfig {
                 ClientSecret::Static(secret)
             },
             redirect_uri: redirect_uri.into(),
-            scopes: provider
-                .default_scopes()
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            endpoints: provider.endpoints(),
+            scopes: spec.default_scopes.clone(),
             authorize_params: Vec::new(),
             verify_signatures: false,
+            spec,
         }
     }
 
@@ -111,6 +119,11 @@ impl ProviderConfig {
         cfg
     }
 
+    /// Id of the provider this registration belongs to.
+    pub fn provider(&self) -> &ProviderId {
+        &self.spec.id
+    }
+
     /// Replaces the requested scopes.
     pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
     where
@@ -123,7 +136,7 @@ impl ProviderConfig {
 
     /// Overrides the endpoints (self-hosted GitLab, Microsoft tenant, tests).
     pub fn with_endpoints(mut self, endpoints: Endpoints) -> Self {
-        self.endpoints = endpoints;
+        self.spec.endpoints = endpoints;
         self
     }
 

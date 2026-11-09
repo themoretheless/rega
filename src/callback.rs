@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::config::REDACTED;
-use crate::{Error, Provider, Result};
+use crate::{Error, ProviderId, Result};
 
 /// Data that must survive the redirect round-trip (store it in the session or
 /// an encrypted, `HttpOnly` cookie). Never expose it to the browser in clear text:
@@ -15,7 +15,7 @@ use crate::{Error, Provider, Result};
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingAuth {
     /// Provider the login was started with.
-    pub provider: Provider,
+    pub provider: ProviderId,
     /// Anti-CSRF `state` value.
     pub state: String,
     /// OIDC `nonce`, for providers that issue an `id_token`.

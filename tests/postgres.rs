@@ -27,7 +27,7 @@ fn identity(
     verified: bool,
 ) -> ExternalIdentity {
     ExternalIdentity {
-        provider,
+        provider: provider.into(),
         subject: subject.into(),
         email: email.map(Into::into),
         email_verified: verified,
@@ -70,7 +70,7 @@ async fn postgres_store_end_to_end() {
     accounts.link(&uid, &gh).await.unwrap();
     assert!(matches!(
         accounts.link(other.user_id(), &gh).await,
-        Err(AccountError::LinkedToAnotherUser(Provider::GitHub))
+        Err(AccountError::LinkedToAnotherUser(p)) if p == Provider::GitHub
     ));
     assert_eq!(accounts.store().logins(&uid).await.unwrap().len(), 3);
     for login in [ExternalLogin::from(&g), ExternalLogin::from(&apple)] {

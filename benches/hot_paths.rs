@@ -51,7 +51,7 @@ fn store(c: &mut Criterion) {
                 avatar_url: None,
             };
             let login = ExternalLogin {
-                provider: Provider::GitHub,
+                provider: Provider::GitHub.into(),
                 subject: i.to_string(),
             };
             store.register(user, login).await.unwrap();
@@ -59,7 +59,7 @@ fn store(c: &mut Criterion) {
     });
     let accounts = Accounts::new(store);
     let identity = ExternalIdentity {
-        provider: Provider::Google,
+        provider: Provider::Google.into(),
         subject: "g".into(),
         email: Some("user9999@example.com".into()),
         email_verified: true,

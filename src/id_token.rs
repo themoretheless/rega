@@ -3,7 +3,6 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
-use crate::clock::now;
 use crate::{Error, Result};
 
 /// Checks the `iss` claim against the expected issuer. `{tenantid}` in the
@@ -39,6 +38,7 @@ pub(crate) fn id_token_claims(
     issuer: Option<&str>,
     client_id: &str,
     nonce: Option<&str>,
+    now: u64,
 ) -> Result<serde_json::Value> {
     let payload = id_token
         .split('.')
@@ -59,7 +59,7 @@ pub(crate) fn id_token_claims(
         return Err(Error::IdToken("unexpected audience".into()));
     }
     match claims["exp"].as_u64() {
-        Some(exp) if exp + 60 >= now() => {}
+        Some(exp) if exp + 60 >= now => {}
         _ => return Err(Error::IdToken("token expired".into())),
     }
     if let Some(nonce) = nonce {
@@ -73,6 +73,7 @@ pub(crate) fn id_token_claims(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::now;
 
     const ISSUER: &str = "https://appleid.apple.com";
 
@@ -86,17 +87,17 @@ mod tests {
             "iss": ISSUER, "aud": "app", "exp": now() + 600, "nonce": "n", "sub": "001"
         }));
         assert_eq!(
-            id_token_claims(&t, Some(ISSUER), "app", Some("n")).unwrap()["sub"],
+            id_token_claims(&t, Some(ISSUER), "app", Some("n"), now()).unwrap()["sub"],
             "001"
         );
-        assert!(id_token_claims(&t, Some(ISSUER), "other", Some("n")).is_err());
-        assert!(id_token_claims(&t, Some(ISSUER), "app", Some("x")).is_err());
-        assert!(id_token_claims(&t, Some("evil"), "app", Some("n")).is_err());
+        assert!(id_token_claims(&t, Some(ISSUER), "other", Some("n"), now()).is_err());
+        assert!(id_token_claims(&t, Some(ISSUER), "app", Some("x"), now()).is_err());
+        assert!(id_token_claims(&t, Some("evil"), "app", Some("n"), now()).is_err());
     }
 
     #[test]
     fn rejects_expired() {
         let t = token(serde_json::json!({ "iss": ISSUER, "aud": "app", "exp": 1 }));
-        assert!(id_token_claims(&t, Some(ISSUER), "app", None).is_err());
+        assert!(id_token_claims(&t, Some(ISSUER), "app", None, now()).is_err());
     }
 }

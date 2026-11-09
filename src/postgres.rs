@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
-use crate::{AccountStore, ExternalLogin, NewUser, Provider, StoreError};
+use crate::{AccountStore, ExternalLogin, NewUser, ProviderId, StoreError};
 
 /// Schema applied by [`PgAccountStore::migrate`]; also shipped as
 /// `migrations/0001_rega.sql` for external migration tools.
@@ -141,9 +141,7 @@ impl AccountStore for PgAccountStore {
             .map(|r| {
                 let provider: String = r.get(0);
                 Ok(ExternalLogin {
-                    provider: provider
-                        .parse::<Provider>()
-                        .map_err(|e| StoreError::Other(e.into()))?,
+                    provider: ProviderId::new(provider),
                     subject: r.get(1),
                 })
             })

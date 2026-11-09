@@ -35,8 +35,8 @@ use axum::routing::get;
 use axum::Router;
 
 use crate::{
-    AccountStore, Accounts, Callback, Error, ExternalIdentity, OAuthClient, PendingAuth, Provider,
-    SignInOutcome,
+    AccountStore, Accounts, Callback, Error, ExternalIdentity, OAuthClient, PendingAuth,
+    ProviderId, SignInOutcome,
 };
 
 const COOKIE: &str = "rega_pending";
@@ -125,10 +125,13 @@ async fn start<S: AccountStore + 'static>(
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let cookie_path = cookie_path(uri.path(), 1);
-    let Ok(provider) = provider.parse::<Provider>() else {
-        return (StatusCode::NOT_FOUND, "unknown provider").into_response();
+    // Unknown ids — built-in or custom — are "not configured", answered as 404.
+    let provider = ProviderId::new(provider);
+    let form_post = match shared.oauth.config(&provider) {
+        Ok(config) => config.spec.form_post,
+        Err(e) => return failure(&e),
     };
-    let req = match shared.oauth.authorize(provider) {
+    let req = match shared.oauth.authorize(&provider) {
         Ok(req) => req,
         Err(e) => return failure(&e),
     };
@@ -136,8 +139,9 @@ async fn start<S: AccountStore + 'static>(
         Ok(s) => s,
         Err(e) => return failure(&e),
     };
-    // Apple posts the callback cross-site, which Lax cookies do not survive.
-    let same_site = if provider == Provider::Apple && shared.secure_cookie {
+    // A form_post callback (Apple) is a cross-site POST, which Lax cookies do
+    // not survive.
+    let same_site = if form_post && shared.secure_cookie {
         "None"
     } else {
         "Lax"
@@ -169,7 +173,7 @@ async fn callback<S: AccountStore + 'static>(
     };
     let pending =
         cookie_value(&headers, COOKIE).and_then(|v| PendingAuth::open(v, &shared.key).ok());
-    let Some(pending) = pending.filter(|p| p.provider.as_str() == provider) else {
+    let Some(pending) = pending.filter(|p| p.provider == ProviderId::new(provider)) else {
         return failure(&Error::StateMismatch);
     };
 

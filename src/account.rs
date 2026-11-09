@@ -5,13 +5,13 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{ExternalIdentity, Provider};
+use crate::{ExternalIdentity, ProviderId};
 
 /// A provider login attached to a local user.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExternalLogin {
     /// Identity provider.
-    pub provider: Provider,
+    pub provider: ProviderId,
     /// Provider-unique user id.
     pub subject: String,
 }
@@ -19,7 +19,7 @@ pub struct ExternalLogin {
 impl From<&ExternalIdentity> for ExternalLogin {
     fn from(i: &ExternalIdentity) -> Self {
         Self {
-            provider: i.provider,
+            provider: i.provider.clone(),
             subject: i.subject.clone(),
         }
     }
@@ -134,7 +134,7 @@ impl<U> SignInOutcome<U> {
 pub enum AccountError {
     #[error("this {0} account is already linked to another user")]
     /// The provider login already belongs to a different user.
-    LinkedToAnotherUser(Provider),
+    LinkedToAnotherUser(ProviderId),
     #[error("cannot remove the only login method")]
     /// Removing this login would leave the user unable to sign in.
     LastLogin,
@@ -219,12 +219,14 @@ impl<S: AccountStore> Accounts<S> {
         let login = ExternalLogin::from(identity);
         match self.store.find_by_login(&login).await? {
             Some(owner) if &owner == user => return Ok(()),
-            Some(_) => return Err(AccountError::LinkedToAnotherUser(identity.provider)),
+            Some(_) => return Err(AccountError::LinkedToAnotherUser(identity.provider.clone())),
             None => {}
         }
         match self.store.add_login(user, login).await {
             Ok(()) => Ok(()),
-            Err(StoreError::Conflict) => Err(AccountError::LinkedToAnotherUser(identity.provider)),
+            Err(StoreError::Conflict) => {
+                Err(AccountError::LinkedToAnotherUser(identity.provider.clone()))
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -363,6 +365,7 @@ impl AccountStore for InMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Provider;
 
     fn identity(
         provider: Provider,
@@ -371,7 +374,7 @@ mod tests {
         verified: bool,
     ) -> ExternalIdentity {
         ExternalIdentity {
-            provider,
+            provider: provider.into(),
             subject: subject.into(),
             email: email.map(Into::into),
             email_verified: verified,
@@ -450,11 +453,11 @@ mod tests {
         accounts.link(&u1, &gh).await.unwrap(); // idempotent
         assert!(matches!(
             accounts.link(&u2, &gh).await,
-            Err(AccountError::LinkedToAnotherUser(Provider::GitHub))
+            Err(AccountError::LinkedToAnotherUser(p)) if p == Provider::GitHub
         ));
 
         let g = ExternalLogin {
-            provider: Provider::Google,
+            provider: Provider::Google.into(),
             subject: "g1".into(),
         };
         assert!(accounts.unlink(&u1, &g, false).await.unwrap());
@@ -491,7 +494,7 @@ mod tests {
     async fn register_conflict_creates_no_user() {
         let store = InMemoryStore::new();
         let login = ExternalLogin {
-            provider: Provider::Google,
+            provider: Provider::Google.into(),
             subject: "g".into(),
         };
         let user = NewUser {

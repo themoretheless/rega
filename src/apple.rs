@@ -4,7 +4,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
 
 use crate::clock::now;
-use crate::Result;
+use crate::{Error, Result};
 
 const APPLE_ISSUER: &str = "https://appleid.apple.com";
 
@@ -38,6 +38,11 @@ struct ClientSecretClaims<'a> {
     sub: &'a str,
 }
 
+/// A bad `.p8` key is a configuration mistake, not a token failure.
+fn key_error(e: jsonwebtoken::errors::Error) -> Error {
+    Error::Config(format!("Apple private key: {e}"))
+}
+
 /// Lifetime of a generated client secret (Apple allows up to 6 months).
 const SECRET_TTL_SECS: u64 = 60 * 60;
 /// Regenerate the cached secret when less than this remains.
@@ -46,8 +51,12 @@ const SECRET_REFRESH_SECS: u64 = 5 * 60;
 impl AppleKey {
     /// Builds a fresh `client_secret` JWT for `client_id` (the Services ID).
     pub fn client_secret(&self, client_id: &str) -> Result<String> {
-        let key = EncodingKey::from_ec_pem(self.private_key_pem.as_bytes())?;
+        let key = self.encoding_key()?;
         self.sign(&key, client_id, now()).map(|(s, _)| s)
+    }
+
+    fn encoding_key(&self) -> Result<EncodingKey> {
+        EncodingKey::from_ec_pem(self.private_key_pem.as_bytes()).map_err(key_error)
     }
 
     fn sign(&self, key: &EncodingKey, client_id: &str, iat: u64) -> Result<(String, u64)> {
@@ -61,7 +70,8 @@ impl AppleKey {
         };
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(self.key_id.clone());
-        Ok((jsonwebtoken::encode(&header, &claims, key)?, exp))
+        let jwt = jsonwebtoken::encode(&header, &claims, key).map_err(key_error)?;
+        Ok((jwt, exp))
     }
 }
 
@@ -110,9 +120,7 @@ impl AppleSigner {
             }
         }
         if cache.encoding_key.is_none() {
-            cache.encoding_key = Some(EncodingKey::from_ec_pem(
-                self.key.private_key_pem.as_bytes(),
-            )?);
+            cache.encoding_key = Some(self.key.encoding_key()?);
         }
         let fresh = self.key.sign(
             cache.encoding_key.as_ref().expect("set above"),

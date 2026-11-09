@@ -98,8 +98,8 @@ mod tests {
         let data = signed("123:ABC", &fields);
         let i = verify_login(&data, "123:ABC", 86400).unwrap();
         assert_eq!(
-            (i.provider, i.subject.as_str(), i.name.as_deref()),
-            (Provider::Telegram, "123", Some("Pavel"))
+            (i.provider.as_str(), i.subject.as_str(), i.name.as_deref()),
+            ("telegram", "123", Some("Pavel"))
         );
 
         assert!(verify_login(&data, "other-bot", 86400).is_err());

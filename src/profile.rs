@@ -7,7 +7,8 @@ use crate::callback::{Callback, PendingAuth};
 use crate::client::{read_json, TokenResponse};
 use crate::config::ProviderConfig;
 use crate::jwks::Jwks;
-use crate::{id_token, Error, ExternalIdentity, Provider, Result};
+use crate::spec::{EmailList, ProfileMapper, ProviderSpec, UserinfoAuth};
+use crate::{id_token, Error, ExternalIdentity, Provider, ProviderId, Result};
 
 pub(crate) async fn fetch(
     http: &reqwest::Client,
@@ -16,79 +17,87 @@ pub(crate) async fn fetch(
     callback: &Callback,
     pending: &PendingAuth,
     jwks: Option<&Jwks>,
+    now: u64,
 ) -> Result<ExternalIdentity> {
-    let provider = cfg.provider;
-    if provider == Provider::Apple {
-        let id_token = token
-            .id_token
-            .as_deref()
-            .ok_or_else(|| Error::InvalidResponse("Apple did not return an id_token".into()))?;
-        let claims = id_token_claims(http, cfg, jwks, id_token, pending.nonce.as_deref()).await?;
-        // Apple sends the user's name only once, on the first authorization.
-        let user = callback
-            .get("user")
-            .and_then(|u| serde_json::from_str(u).ok());
-        return map_apple(claims, user);
-    }
+    let spec = &cfg.spec;
 
     // OIDC providers: validate the id_token once (binds the response to this
     // login attempt via nonce) and, when it already carries the profile, skip
-    // the userinfo round-trip.
+    // the userinfo round-trip. Providers that only add the `email` claim on
+    // request (Microsoft, GitLab) fall back to userinfo without it.
     if let (Some(nonce), Some(id_token)) = (pending.nonce.as_deref(), token.id_token.as_deref()) {
-        let claims = id_token_claims(http, cfg, jwks, id_token, Some(nonce)).await?;
-        // Google always includes the profile; Microsoft and GitLab only when the
-        // optional `email` claim is configured, otherwise fall back to userinfo.
-        if provider == Provider::Google || claims["email"].is_string() {
-            return map_profile(provider, claims);
+        let claims = id_token_claims(http, cfg, jwks, id_token, Some(nonce), now).await?;
+        let in_token = spec.profile_in_id_token || spec.endpoints.userinfo.is_none();
+        if in_token || claims["email"].is_string() {
+            return map(spec, claims, callback);
         }
     }
 
-    let userinfo = cfg
-        .endpoints
-        .userinfo
-        .as_deref()
-        .ok_or_else(|| Error::Config(format!("{provider}: userinfo endpoint is not set")))?;
-    let access = &token.access_token;
+    let Some(userinfo) = spec.endpoints.userinfo.as_deref() else {
+        // No userinfo endpoint (Apple): the id_token is the only profile source.
+        return Err(Error::InvalidResponse(format!(
+            "{} returned no id_token and has no userinfo endpoint",
+            spec.id
+        )));
+    };
+    let access = token.access_token.as_str();
 
-    let req = match provider {
-        // Mail.ru expects the token as a query parameter.
-        Provider::MailRu => http
-            .get(userinfo)
-            .query(&[("access_token", access.as_str())]),
-        Provider::Yandex => http
+    let req = match spec.userinfo_auth {
+        UserinfoAuth::Bearer => http.get(userinfo).bearer_auth(access),
+        UserinfoAuth::Query => http.get(userinfo).query(&[("access_token", access)]),
+        UserinfoAuth::OAuthHeader => http
             .get(userinfo)
             .header("Authorization", format!("OAuth {access}")),
-        Provider::Vk => http.post(userinfo).form(&[
+        UserinfoAuth::FormWithClientId => http.post(userinfo).form(&[
             ("client_id", cfg.client_id.as_str()),
-            ("access_token", access.as_str()),
+            ("access_token", access),
         ]),
-        Provider::Facebook => {
+        UserinfoAuth::BearerWithAppSecretProof => {
             let mut req = http.get(userinfo).bearer_auth(access);
             if let Some(secret) = cfg.client_secret.static_secret() {
                 req = req.query(&[("appsecret_proof", appsecret_proof(secret, access))]);
             }
             req
         }
-        _ => http.get(userinfo).bearer_auth(access),
     };
     let profile = async { read_json(req.header("Accept", "application/json").send().await?).await };
 
-    match (provider, cfg.endpoints.emails.as_deref()) {
-        (Provider::GitHub | Provider::Bitbucket, Some(emails_url)) => {
-            // Both calls only need the token: run them concurrently.
-            let emails =
-                async { read_json(http.get(emails_url).bearer_auth(access).send().await?).await };
-            let (profile, emails) = futures_util::future::join(profile, emails).await;
-            let mut identity = map_profile(provider, profile?)?;
-            if provider == Provider::GitHub {
-                apply_github_emails(&mut identity, &emails?);
-            } else {
-                apply_bitbucket_emails(&mut identity, &emails?);
-            }
-            Ok(identity)
+    let apply_emails: fn(&mut ExternalIdentity, &Value) = match spec.email_list {
+        EmailList::None => return map(spec, profile.await?, callback),
+        EmailList::GitHub => apply_github_emails,
+        EmailList::Bitbucket => apply_bitbucket_emails,
+    };
+    let Some(emails_url) = spec.endpoints.emails.as_deref() else {
+        return map(spec, profile.await?, callback);
+    };
+    // Both calls only need the token: run them concurrently.
+    let emails = async { read_json(http.get(emails_url).bearer_auth(access).send().await?).await };
+    let (profile, emails) = futures_util::future::join(profile, emails).await;
+    let mut identity = map(spec, profile?, callback)?;
+    apply_emails(&mut identity, &emails?);
+    Ok(identity)
+}
+
+/// Applies the spec's [`ProfileMapper`] and stamps the result with its id.
+pub(crate) fn map(
+    spec: &ProviderSpec,
+    payload: Value,
+    callback: &Callback,
+) -> Result<ExternalIdentity> {
+    let mut identity = match spec.mapper {
+        ProfileMapper::Builtin(Provider::Apple) => {
+            // Apple sends the user's name only once, on the first authorization.
+            let user = callback
+                .get("user")
+                .and_then(|u| serde_json::from_str(u).ok());
+            map_apple(payload, user)?
         }
-        _ => map_profile(provider, profile.await?),
-    }
+        ProfileMapper::Builtin(provider) => map_profile(provider, payload)?,
+        ProfileMapper::Oidc => map_oidc(payload)?,
+        ProfileMapper::Custom(f) => f(payload)?,
+    };
+    identity.provider = spec.id.clone();
+    Ok(identity)
 }
 
 /// Validates `id_token` claims; additionally verifies the signature against the
@@ -99,15 +108,38 @@ async fn id_token_claims(
     jwks: Option<&Jwks>,
     id_token: &str,
     nonce: Option<&str>,
+    now: u64,
 ) -> Result<Value> {
-    let issuer = cfg.endpoints.issuer.as_deref();
+    let issuer = cfg.spec.endpoints.issuer.as_deref();
     match jwks.filter(|_| cfg.verify_signatures) {
         Some(jwks) => {
             jwks.verify(http, issuer, id_token, &cfg.client_id, nonce)
                 .await
         }
-        None => id_token::id_token_claims(id_token, issuer, &cfg.client_id, nonce),
+        None => id_token::id_token_claims(id_token, issuer, &cfg.client_id, nonce, now),
     }
+}
+
+/// Maps standard OpenID Connect claims (from an `id_token` or the userinfo
+/// endpoint) to an [`ExternalIdentity`]. The `provider` field is a
+/// placeholder; [`OAuthClient`](crate::OAuthClient) sets it to the spec's id.
+pub fn map_oidc(p: Value) -> Result<ExternalIdentity> {
+    let s = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+    let subject = match &p["sub"] {
+        Value::String(sub) if !sub.is_empty() => sub.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return Err(Error::InvalidResponse("profile has no `sub`".into())),
+    };
+    let email = s(&p["email"]).map(|e| normalize_email(&e));
+    Ok(ExternalIdentity {
+        provider: ProviderId::new("oidc"),
+        subject,
+        email_verified: email.is_some() && truthy(&p["email_verified"]),
+        email,
+        name: s(&p["name"]).or_else(|| s(&p["preferred_username"])),
+        avatar_url: s(&p["picture"]),
+        raw: p,
+    })
 }
 
 /// Maps a provider's userinfo payload to an [`ExternalIdentity`].
@@ -254,7 +286,7 @@ pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {
     let subject = subject
         .ok_or_else(|| Error::InvalidResponse(format!("{provider}: profile has no user id")))?;
     Ok(ExternalIdentity {
-        provider,
+        provider: provider.into(),
         subject,
         email_verified: email_verified && email.is_some(),
         email: email.map(|e| normalize_email(&e)),
@@ -282,7 +314,7 @@ pub fn map_apple(claims: Value, user: Option<Value>) -> Result<ExternalIdentity>
         raw["user"] = u;
     }
     Ok(ExternalIdentity {
-        provider: Provider::Apple,
+        provider: Provider::Apple.into(),
         subject,
         email_verified: email.is_some() && truthy(&raw["email_verified"]),
         email,

@@ -160,3 +160,39 @@ async fn cookie_is_scoped_to_the_mount_point_when_nested() {
         "{cleared}"
     );
 }
+
+#[tokio::test]
+async fn custom_provider_gets_its_own_route() {
+    use rega::{ProfileMapper, ProviderSpec};
+    let server = MockServer::start().await;
+    let endpoints = Endpoints {
+        authorize: format!("{}/authorize", server.uri()),
+        token: format!("{}/token", server.uri()),
+        userinfo: Some(format!("{}/userinfo", server.uri())),
+        ..Endpoints::default()
+    };
+    let spec = ProviderSpec::oauth2("intranet", endpoints, ProfileMapper::Oidc);
+    let oauth = OAuthClient::new().register(ProviderConfig::custom(
+        spec,
+        "c",
+        "s",
+        "https://app.test/auth/intranet/callback",
+    ));
+    let app = AuthRoutes::new(oauth, Accounts::new(InMemoryStore::new()), [1u8; 32]).router();
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/auth/Intranet").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(resp.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .starts_with(&server.uri()));
+    // GitHub is built in but not registered here.
+    let resp = app
+        .oneshot(Request::get("/auth/github").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
