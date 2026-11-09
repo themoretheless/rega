@@ -19,7 +19,8 @@ jsonwebtoken = "9.3"
 rand = "0.8"
 sqlx = { version = "0.8", optional = true, default-features = false, features = ["postgres", "runtime-tokio"] }
 reqwest = { version = "0.12", default-features = false }
-axum = { version = "0.8", optional = true, default-features = false, features = ["form", "query"] }
+axum = { version = "0.8", optional = true, default-features = false, features = ["form", "query", "original-uri"] }
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -33,7 +34,7 @@ rustls = ["reqwest/rustls-tls"]
 ## TLS via the platform library (OpenSSL / SChannel / Security.framework).
 native-tls = ["reqwest/native-tls"]
 ## Ready-made axum routes `/auth/{provider}` and `/auth/{provider}/callback`.
-axum = ["dep:axum", "cookie"]
+axum = ["dep:axum", "dep:tracing", "cookie"]
 ## `PendingAuth::seal` / `PendingAuth::open` for storing login state in a cookie.
 cookie = ["dep:aes-gcm"]
 ## `PgAccountStore`: PostgreSQL storage via sqlx.
@@ -44,7 +45,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
-axum = { version = "0.8", default-features = false, features = ["form", "query"] }
+axum = { version = "0.8", default-features = false, features = ["form", "query", "original-uri"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 criterion = { version = "0.5", default-features = false, features = ["async_tokio"] }
 

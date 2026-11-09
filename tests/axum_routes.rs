@@ -28,6 +28,7 @@ async fn app() -> (axum::Router, MockServer) {
         emails: None,
         jwks: None,
         revoke: None,
+        issuer: None,
     };
     let oauth = OAuthClient::new().register(
         ProviderConfig::new(
@@ -113,4 +114,49 @@ async fn unknown_provider_is_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn cookie_is_scoped_to_the_mount_point_when_nested() {
+    let (app, _server) = app().await;
+    let app = axum::Router::new().nest("/api", app);
+    let start = app
+        .clone()
+        .oneshot(
+            Request::get("/api/auth/github")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::SEE_OTHER);
+    let cookie = start.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(cookie.contains("; Path=/api/auth;"), "{cookie}");
+
+    let location = start.headers()[header::LOCATION].to_str().unwrap();
+    let state = url::Url::parse(location)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let done = app
+        .oneshot(
+            Request::get(format!("/api/auth/github/callback?code=c&state={state}"))
+                .header(header::COOKIE, cookie.split(';').next().unwrap())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.status(), StatusCode::OK);
+    let cleared = done.headers()[header::SET_COOKIE].to_str().unwrap();
+    assert!(
+        cleared.contains("Path=/api/auth;") && cleared.contains("Max-Age=0"),
+        "{cleared}"
+    );
 }

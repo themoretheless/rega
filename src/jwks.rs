@@ -6,9 +6,9 @@ use std::sync::RwLock;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
 
-use crate::apple::now;
+use crate::apple::{check_issuer, now};
 use crate::client::read_json;
-use crate::{Error, Provider, Result};
+use crate::{Error, Result};
 
 /// Do not refetch a key set more often than this (protects against `kid`
 /// spraying forcing a request per token).
@@ -49,7 +49,7 @@ impl Jwks {
     pub(crate) async fn verify(
         &self,
         http: &reqwest::Client,
-        provider: Provider,
+        issuer: Option<&str>,
         id_token: &str,
         client_id: &str,
         nonce: Option<&str>,
@@ -76,20 +76,9 @@ impl Jwks {
         let mut validation = Validation::new(alg);
         validation.set_audience(&[client_id]);
         validation.leeway = 60;
-        let issuers = provider.issuers();
-        if !issuers.is_empty() {
-            validation.set_issuer(issuers);
-        }
         let claims = jsonwebtoken::decode::<serde_json::Value>(id_token, &key, &validation)?.claims;
 
-        if provider == Provider::Microsoft {
-            // Multi-tenant issuer: https://login.microsoftonline.com/{tid}/v2.0
-            let tid = claims["tid"].as_str().unwrap_or_default();
-            let expected = format!("https://login.microsoftonline.com/{tid}/v2.0");
-            if tid.is_empty() || claims["iss"].as_str() != Some(expected.as_str()) {
-                return Err(Error::IdToken("unexpected issuer".into()));
-            }
-        }
+        check_issuer(&claims, issuer)?;
         if let Some(nonce) = nonce {
             if claims["nonce"].as_str() != Some(nonce) {
                 return Err(Error::IdToken("nonce mismatch".into()));

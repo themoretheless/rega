@@ -72,6 +72,10 @@ pub struct Endpoints {
     pub jwks: Option<String>,
     /// Token revocation endpoint (RFC 7009).
     pub revoke: Option<String>,
+    /// Expected `iss` claim of the provider's `id_token`. `{tenantid}` is
+    /// replaced with the token's `tid` claim (Microsoft multi-tenant apps).
+    /// `None` disables the issuer check.
+    pub issuer: Option<String>,
 }
 
 impl Endpoints {
@@ -97,6 +101,7 @@ impl Endpoints {
             emails: None,
             jwks: Some(format!("{base}/oauth/discovery/keys")),
             revoke: Some(format!("{base}/oauth/revoke")),
+            issuer: Some(base.to_owned()),
         }
     }
 
@@ -122,6 +127,7 @@ impl Endpoints {
             emails: None,
             jwks: field("jwks_uri"),
             revoke: field("revocation_endpoint"),
+            issuer: field("issuer"),
         })
     }
 }
@@ -297,6 +303,7 @@ impl Provider {
             emails: emails.map(Into::into),
             jwks: self.jwks_uri().map(Into::into),
             revoke: self.revoke_uri().map(Into::into),
+            issuer: self.issuer().map(Into::into),
         }
     }
 
@@ -328,15 +335,15 @@ impl Provider {
         }
     }
 
-    /// Accepted `iss` values of the provider's `id_token`. Empty when the issuer
-    /// is tenant/host specific (Microsoft is checked against the `tid` claim).
-    pub(crate) fn issuers(self) -> &'static [&'static str] {
+    fn issuer(self) -> Option<&'static str> {
         match self {
-            Provider::Google => &["https://accounts.google.com", "accounts.google.com"],
-            Provider::Apple => &["https://appleid.apple.com"],
-            Provider::Twitch => &["https://id.twitch.tv/oauth2"],
-            Provider::Slack => &["https://slack.com"],
-            _ => &[],
+            Provider::Google => Some("https://accounts.google.com"),
+            Provider::Apple => Some("https://appleid.apple.com"),
+            Provider::Microsoft => Some("https://login.microsoftonline.com/{tenantid}/v2.0"),
+            Provider::GitLab => Some("https://gitlab.com"),
+            Provider::Twitch => Some("https://id.twitch.tv/oauth2"),
+            Provider::Slack => Some("https://slack.com"),
+            _ => None,
         }
     }
 

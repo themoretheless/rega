@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{OriginalUri, Path, RawQuery, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -121,7 +121,9 @@ impl<S: AccountStore + 'static> AuthRoutes<S> {
 async fn start<S: AccountStore + 'static>(
     State(shared): State<Arc<Shared<S>>>,
     Path(provider): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Response {
+    let cookie_path = cookie_path(uri.path(), 1);
     let Ok(provider) = provider.parse::<Provider>() else {
         return (StatusCode::NOT_FOUND, "unknown provider").into_response();
     };
@@ -141,7 +143,7 @@ async fn start<S: AccountStore + 'static>(
     };
     let secure = if shared.secure_cookie { "; Secure" } else { "" };
     let cookie = format!(
-        "{COOKIE}={sealed}; Path=/auth; HttpOnly; SameSite={same_site}; Max-Age=900{secure}"
+        "{COOKIE}={sealed}; Path={cookie_path}; HttpOnly; SameSite={same_site}; Max-Age=900{secure}"
     );
     (
         [(header::SET_COOKIE, cookie)],
@@ -153,6 +155,7 @@ async fn start<S: AccountStore + 'static>(
 async fn callback<S: AccountStore + 'static>(
     State(shared): State<Arc<Shared<S>>>,
     Path(provider): Path<String>,
+    OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
@@ -175,15 +178,37 @@ async fn callback<S: AccountStore + 'static>(
     };
     let outcome = match shared.accounts.sign_in(&identity).await {
         Ok(outcome) => outcome,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed").into_response(),
+        Err(error) => {
+            tracing::error!(provider = %identity.provider, %error, "rega: account sign-in failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed").into_response();
+        }
     };
 
     let mut response = (shared.on_success)(SignedIn { outcome, identity });
-    let clear = format!("{COOKIE}=; Path=/auth; HttpOnly; Max-Age=0");
+    let clear = format!(
+        "{COOKIE}=; Path={}; HttpOnly; Max-Age=0",
+        cookie_path(uri.path(), 2)
+    );
     if let Ok(value) = clear.parse() {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
+}
+
+/// The routes' mount point as the browser sees it (`/auth`, or `/api/auth`
+/// when the router is nested): the request path without its last
+/// `segments` segments. The cookie is scoped to it so it is sent to the
+/// callback and nowhere else.
+fn cookie_path(request_path: &str, segments: usize) -> &str {
+    let mut path = request_path.trim_end_matches('/');
+    for _ in 0..segments {
+        path = path.rsplit_once('/').map_or("", |(head, _)| head);
+    }
+    if path.is_empty() {
+        "/"
+    } else {
+        path
+    }
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -199,6 +224,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 /// Maps errors to a status without leaking provider details to the browser.
 fn failure(error: &Error) -> Response {
+    tracing::warn!(%error, "rega: login failed");
     let (status, message) = match error {
         Error::Provider { error, .. } if error == "access_denied" => {
             (StatusCode::FORBIDDEN, "login cancelled")
