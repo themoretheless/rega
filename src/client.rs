@@ -1,14 +1,15 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use url::Url;
 
 use std::sync::Arc;
 
-use crate::apple::{self, AppleKey, AppleSigner};
+use crate::callback::{AuthorizationRequest, Callback, PendingAuth};
+use crate::clock;
+use crate::config::{ProviderConfig, REDACTED};
 use crate::jwks::Jwks;
-use crate::provider::{ClientAuth, Endpoints};
+use crate::provider::ClientAuth;
 use crate::{pkce, profile, Error, ExternalIdentity, Provider, Result};
 
 /// How long a [`PendingAuth`] stays valid.
@@ -17,265 +18,6 @@ const PENDING_TTL_SECS: u64 = 15 * 60;
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Client credential used at the token endpoint. `Debug` never prints the secret.
-#[derive(Clone)]
-pub enum ClientSecret {
-    /// Public client: PKCE only, no secret.
-    None,
-    /// Fixed client secret.
-    Static(String),
-    /// Sign in with Apple: the secret is generated from the `.p8` key and
-    /// cached until shortly before it expires.
-    Apple(AppleSigner),
-}
-
-/// Placeholder printed instead of secret values in `Debug` output.
-const REDACTED: &str = "[redacted]";
-
-impl std::fmt::Debug for ClientSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientSecret::None => f.write_str("None"),
-            ClientSecret::Static(_) => write!(f, "Static({REDACTED})"),
-            ClientSecret::Apple(signer) => f.debug_tuple("Apple").field(signer.key()).finish(),
-        }
-    }
-}
-
-impl ClientSecret {
-    pub(crate) fn static_secret(&self) -> Option<&str> {
-        match self {
-            ClientSecret::Static(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn resolve(&self, client_id: &str) -> Result<Option<String>> {
-        match self {
-            ClientSecret::None => Ok(None),
-            ClientSecret::Static(s) => Ok(Some(s.clone())),
-            ClientSecret::Apple(signer) => signer.client_secret(client_id).map(Some),
-        }
-    }
-}
-
-/// Application registration at a provider.
-#[derive(Debug, Clone)]
-pub struct ProviderConfig {
-    /// Provider this registration belongs to.
-    pub provider: Provider,
-    /// OAuth client id.
-    pub client_id: String,
-    /// Credential for the token endpoint.
-    pub client_secret: ClientSecret,
-    /// Redirect URI registered at the provider.
-    pub redirect_uri: String,
-    /// Requested scopes; defaults to [`Provider::default_scopes`].
-    pub scopes: Vec<String>,
-    /// Provider endpoints; defaults to [`Provider::endpoints`].
-    pub endpoints: Endpoints,
-    /// Extra query parameters for the authorization URL (`prompt`, `hd`, ...).
-    pub authorize_params: Vec<(String, String)>,
-    /// Verify `id_token` signatures against the provider's JWKS during the
-    /// code flow. Off by default: the token comes straight from the token
-    /// endpoint over TLS (OIDC Core §3.1.3.7), and verification costs a
-    /// (cached) key-set download. Tokens passed to
-    /// [`OAuthClient::verify_id_token`] are always verified.
-    pub verify_signatures: bool,
-}
-
-impl ProviderConfig {
-    /// Registration with default scopes and endpoints. An empty secret makes a public (PKCE-only) client.
-    pub fn new(
-        provider: Provider,
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-    ) -> Self {
-        let secret = client_secret.into();
-        Self {
-            provider,
-            client_id: client_id.into(),
-            client_secret: if secret.is_empty() {
-                ClientSecret::None
-            } else {
-                ClientSecret::Static(secret)
-            },
-            redirect_uri: redirect_uri.into(),
-            scopes: provider
-                .default_scopes()
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            endpoints: provider.endpoints(),
-            authorize_params: Vec::new(),
-            verify_signatures: false,
-        }
-    }
-
-    /// Sign in with Apple. `client_id` is the Services ID.
-    pub fn apple(
-        client_id: impl Into<String>,
-        key: AppleKey,
-        redirect_uri: impl Into<String>,
-    ) -> Self {
-        let mut cfg = Self::new(Provider::Apple, client_id, "", redirect_uri);
-        cfg.client_secret = ClientSecret::Apple(AppleSigner::new(key));
-        cfg
-    }
-
-    /// Replaces the requested scopes.
-    pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.scopes = scopes.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Overrides the endpoints (self-hosted GitLab, Microsoft tenant, tests).
-    pub fn with_endpoints(mut self, endpoints: Endpoints) -> Self {
-        self.endpoints = endpoints;
-        self
-    }
-
-    /// Enables JWKS signature verification of `id_token` in the code flow.
-    pub fn with_signature_verification(mut self) -> Self {
-        self.verify_signatures = true;
-        self
-    }
-
-    /// Adds an extra query parameter to the authorization URL.
-    pub fn with_authorize_param(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        self.authorize_params.push((key.into(), value.into()));
-        self
-    }
-}
-
-/// Data that must survive the redirect round-trip (store it in the session or
-/// an encrypted, `HttpOnly` cookie). Never expose it to the browser in clear text:
-/// it contains the PKCE verifier. `Debug` prints none of the secret values.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingAuth {
-    /// Provider the login was started with.
-    pub provider: Provider,
-    /// Anti-CSRF `state` value.
-    pub state: String,
-    /// OIDC `nonce`, for providers that issue an `id_token`.
-    pub nonce: Option<String>,
-    /// PKCE verifier, for providers that support PKCE.
-    pub code_verifier: Option<String>,
-    /// Unix time the attempt was started.
-    pub created_at: u64,
-}
-
-impl std::fmt::Debug for PendingAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingAuth")
-            .field("provider", &self.provider)
-            .field("state", &REDACTED)
-            .field("nonce", &self.nonce.as_ref().map(|_| REDACTED))
-            .field(
-                "code_verifier",
-                &self.code_verifier.as_ref().map(|_| REDACTED),
-            )
-            .field("created_at", &self.created_at)
-            .finish()
-    }
-}
-
-/// Where to send the user, plus the state to keep until the callback.
-/// `Debug` omits the URL query, which carries the `state`.
-#[derive(Clone)]
-pub struct AuthorizationRequest {
-    /// URL to redirect the user to.
-    pub url: Url,
-    /// State to keep until the callback.
-    pub pending: PendingAuth,
-}
-
-impl std::fmt::Debug for AuthorizationRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut url = self.url.clone();
-        url.set_query(None);
-        f.debug_struct("AuthorizationRequest")
-            .field("url", &url.as_str())
-            .field("pending", &self.pending)
-            .finish()
-    }
-}
-
-/// Parameters the provider sent to the redirect URI (query string, or form
-/// body for Apple's `form_post`). `Debug` prints parameter names only: the
-/// values include the authorization code.
-#[derive(Clone, Default)]
-pub struct Callback {
-    params: HashMap<String, String>,
-    /// Names that appeared more than once. A repeated parameter is how
-    /// parameter-pollution attacks make two parsers disagree, so such
-    /// callbacks are rejected rather than resolved first- or last-wins.
-    duplicates: Vec<String>,
-}
-
-impl std::fmt::Debug for Callback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut names: Vec<&str> = self.params.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        f.debug_struct("Callback").field("params", &names).finish()
-    }
-}
-
-impl Callback {
-    /// Value of a callback parameter.
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.params.get(key).map(String::as_str)
-    }
-
-    /// Name of a parameter that was sent more than once, if any.
-    pub fn duplicate(&self) -> Option<&str> {
-        self.duplicates.first().map(String::as_str)
-    }
-
-    pub(crate) fn reject_duplicates(&self) -> Result<()> {
-        match self.duplicate() {
-            Some(name) => Err(Error::InvalidResponse(format!(
-                "callback parameter `{name}` is repeated"
-            ))),
-            None => Ok(()),
-        }
-    }
-
-    /// All parameters, in no particular order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.params.iter().map(|(k, v)| (k.as_str(), v.as_str()))
-    }
-
-    /// Parses a raw query string or `application/x-www-form-urlencoded` body.
-    pub fn parse(query: &str) -> Self {
-        url::form_urlencoded::parse(query.trim_start_matches('?').as_bytes()).collect()
-    }
-}
-
-impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Callback {
-    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
-        let mut callback = Self::default();
-        for (k, v) in iter {
-            match callback.params.entry(k.into()) {
-                Entry::Occupied(seen) => callback.duplicates.push(seen.key().clone()),
-                Entry::Vacant(slot) => {
-                    slot.insert(v.into());
-                }
-            }
-        }
-        callback
-    }
-}
 
 /// Token endpoint response. `Debug` prints no token values.
 #[derive(Clone, Deserialize)]
@@ -507,7 +249,7 @@ impl OAuthClient {
                 state,
                 nonce,
                 code_verifier,
-                created_at: apple::now(),
+                created_at: clock::now(),
             },
         })
     }
@@ -533,7 +275,7 @@ impl OAuthClient {
         if pending.state.is_empty() || !pkce::constant_time_eq(state, &pending.state) {
             return Err(Error::StateMismatch);
         }
-        if apple::now().saturating_sub(pending.created_at) > PENDING_TTL_SECS {
+        if clock::now().saturating_sub(pending.created_at) > PENDING_TTL_SECS {
             return Err(Error::Expired);
         }
         let code = callback

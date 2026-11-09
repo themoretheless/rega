@@ -42,10 +42,14 @@ mod account;
 mod apple;
 #[cfg(feature = "axum")]
 pub mod axum;
+mod callback;
 mod client;
+mod clock;
+mod config;
 #[cfg(feature = "cookie")]
 mod cookie;
 mod error;
+mod id_token;
 mod identity;
 mod jwks;
 mod pkce;
@@ -60,10 +64,9 @@ pub use account::{
     SignInOutcome, StoreError,
 };
 pub use apple::{AppleKey, AppleSigner};
-pub use client::{
-    AuthorizationRequest, Callback, ClientSecret, OAuthClient, PendingAuth, ProviderConfig,
-    TokenResponse,
-};
+pub use callback::{AuthorizationRequest, Callback, PendingAuth};
+pub use client::{OAuthClient, TokenResponse};
+pub use config::{ClientSecret, ProviderConfig};
 pub use error::{Error, Result};
 pub use identity::ExternalIdentity;
 #[cfg(feature = "postgres")]

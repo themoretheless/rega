@@ -6,8 +6,9 @@ use std::sync::RwLock;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
 
-use crate::apple::{check_issuer, now};
 use crate::client::read_json;
+use crate::clock::now;
+use crate::id_token::check_issuer;
 use crate::{Error, Result};
 
 /// Do not refetch a key set more often than this (protects against `kid`

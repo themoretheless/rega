@@ -3,9 +3,11 @@
 
 use serde_json::Value;
 
-use crate::client::{read_json, Callback, PendingAuth, ProviderConfig, TokenResponse};
+use crate::callback::{Callback, PendingAuth};
+use crate::client::{read_json, TokenResponse};
+use crate::config::ProviderConfig;
 use crate::jwks::Jwks;
-use crate::{apple, Error, ExternalIdentity, Provider, Result};
+use crate::{id_token, Error, ExternalIdentity, Provider, Result};
 
 pub(crate) async fn fetch(
     http: &reqwest::Client,
@@ -104,7 +106,7 @@ async fn id_token_claims(
             jwks.verify(http, issuer, id_token, &cfg.client_id, nonce)
                 .await
         }
-        None => apple::id_token_claims(id_token, issuer, &cfg.client_id, nonce),
+        None => id_token::id_token_claims(id_token, issuer, &cfg.client_id, nonce),
     }
 }
 

@@ -7,7 +7,7 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::{apple, pkce, profile, Callback, Error, ExternalIdentity, Provider, Result};
+use crate::{clock, pkce, profile, Callback, Error, ExternalIdentity, Provider, Result};
 
 /// Verifies widget data and returns the identity. Data older than
 /// `max_age_secs` is rejected to limit replay of leaked login links.
@@ -44,7 +44,7 @@ pub fn verify_login(
         .get("auth_date")
         .and_then(|d| d.parse().ok())
         .ok_or_else(|| invalid("missing auth_date"))?;
-    if apple::now().saturating_sub(auth_date) > max_age_secs {
+    if clock::now().saturating_sub(auth_date) > max_age_secs {
         return Err(Error::Expired);
     }
 
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn accepts_valid_and_rejects_tampered() {
-        let now = apple::now().to_string();
+        let now = clock::now().to_string();
         let fields = [
             ("id", "123".to_string()),
             ("first_name", "Pavel".to_string()),
