@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,8 @@ const MAX_RESPONSE_BYTES: usize = 1 << 20;
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Client credential used at the token endpoint.
-#[derive(Debug, Clone)]
+/// Client credential used at the token endpoint. `Debug` never prints the secret.
+#[derive(Clone)]
 pub enum ClientSecret {
     /// Public client: PKCE only, no secret.
     None,
@@ -27,6 +28,19 @@ pub enum ClientSecret {
     /// Sign in with Apple: the secret is generated from the `.p8` key and
     /// cached until shortly before it expires.
     Apple(AppleSigner),
+}
+
+/// Placeholder printed instead of secret values in `Debug` output.
+const REDACTED: &str = "[redacted]";
+
+impl std::fmt::Debug for ClientSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientSecret::None => f.write_str("None"),
+            ClientSecret::Static(_) => write!(f, "Static({REDACTED})"),
+            ClientSecret::Apple(signer) => f.debug_tuple("Apple").field(signer.key()).finish(),
+        }
+    }
 }
 
 impl ClientSecret {
@@ -146,8 +160,8 @@ impl ProviderConfig {
 
 /// Data that must survive the redirect round-trip (store it in the session or
 /// an encrypted, `HttpOnly` cookie). Never expose it to the browser in clear text:
-/// it contains the PKCE verifier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// it contains the PKCE verifier. `Debug` prints none of the secret values.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingAuth {
     /// Provider the login was started with.
     pub provider: Provider,
@@ -161,8 +175,24 @@ pub struct PendingAuth {
     pub created_at: u64,
 }
 
+impl std::fmt::Debug for PendingAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAuth")
+            .field("provider", &self.provider)
+            .field("state", &REDACTED)
+            .field("nonce", &self.nonce.as_ref().map(|_| REDACTED))
+            .field(
+                "code_verifier",
+                &self.code_verifier.as_ref().map(|_| REDACTED),
+            )
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
 /// Where to send the user, plus the state to keep until the callback.
-#[derive(Debug, Clone)]
+/// `Debug` omits the URL query, which carries the `state`.
+#[derive(Clone)]
 pub struct AuthorizationRequest {
     /// URL to redirect the user to.
     pub url: Url,
@@ -170,17 +200,55 @@ pub struct AuthorizationRequest {
     pub pending: PendingAuth,
 }
 
+impl std::fmt::Debug for AuthorizationRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut url = self.url.clone();
+        url.set_query(None);
+        f.debug_struct("AuthorizationRequest")
+            .field("url", &url.as_str())
+            .field("pending", &self.pending)
+            .finish()
+    }
+}
+
 /// Parameters the provider sent to the redirect URI (query string, or form
-/// body for Apple's `form_post`).
-#[derive(Debug, Clone, Default)]
+/// body for Apple's `form_post`). `Debug` prints parameter names only: the
+/// values include the authorization code.
+#[derive(Clone, Default)]
 pub struct Callback {
     params: HashMap<String, String>,
+    /// Names that appeared more than once. A repeated parameter is how
+    /// parameter-pollution attacks make two parsers disagree, so such
+    /// callbacks are rejected rather than resolved first- or last-wins.
+    duplicates: Vec<String>,
+}
+
+impl std::fmt::Debug for Callback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&str> = self.params.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        f.debug_struct("Callback").field("params", &names).finish()
+    }
 }
 
 impl Callback {
     /// Value of a callback parameter.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.params.get(key).map(String::as_str)
+    }
+
+    /// Name of a parameter that was sent more than once, if any.
+    pub fn duplicate(&self) -> Option<&str> {
+        self.duplicates.first().map(String::as_str)
+    }
+
+    pub(crate) fn reject_duplicates(&self) -> Result<()> {
+        match self.duplicate() {
+            Some(name) => Err(Error::InvalidResponse(format!(
+                "callback parameter `{name}` is repeated"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// All parameters, in no particular order.
@@ -196,17 +264,21 @@ impl Callback {
 
 impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Callback {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
-        Self {
-            params: iter
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
+        let mut callback = Self::default();
+        for (k, v) in iter {
+            match callback.params.entry(k.into()) {
+                Entry::Occupied(seen) => callback.duplicates.push(seen.key().clone()),
+                Entry::Vacant(slot) => {
+                    slot.insert(v.into());
+                }
+            }
         }
+        callback
     }
 }
 
-/// Token endpoint response.
-#[derive(Debug, Clone, Deserialize)]
+/// Token endpoint response. `Debug` prints no token values.
+#[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     /// Access token.
     pub access_token: String,
@@ -225,6 +297,24 @@ pub struct TokenResponse {
     #[serde(flatten)]
     /// Provider-specific extra fields.
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut extra: Vec<&str> = self.extra.keys().map(String::as_str).collect();
+        extra.sort_unstable();
+        f.debug_struct("TokenResponse")
+            .field("access_token", &REDACTED)
+            .field("token_type", &self.token_type)
+            .field("id_token", &self.id_token.as_ref().map(|_| REDACTED))
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| REDACTED),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("extra", &extra)
+            .finish()
+    }
 }
 
 /// OAuth 2.0 / OIDC client for all configured providers.
@@ -304,7 +394,13 @@ impl OAuthClient {
         })?;
         let aud = audience.unwrap_or(&cfg.client_id);
         let claims = jwks
-            .verify(&self.http, provider, id_token, aud, nonce)
+            .verify(
+                &self.http,
+                cfg.endpoints.issuer.as_deref(),
+                id_token,
+                aud,
+                nonce,
+            )
             .await?;
         match provider {
             Provider::Apple => profile::map_apple(claims, None),
@@ -423,6 +519,7 @@ impl OAuthClient {
         callback: &Callback,
         pending: &PendingAuth,
     ) -> Result<ExternalIdentity> {
+        callback.reject_duplicates()?;
         if let Some(error) = callback.get("error") {
             return Err(Error::Provider {
                 error: error.to_string(),

@@ -134,13 +134,37 @@ pub(crate) fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Checks the `iss` claim against the expected issuer. `{tenantid}` in the
+/// expectation stands for the token's own `tid` claim (Microsoft), and Google's
+/// scheme-less spelling is accepted as the spec allows.
+pub(crate) fn check_issuer(claims: &serde_json::Value, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let iss = claims["iss"].as_str().unwrap_or_default();
+    let ok = if expected.contains("{tenantid}") {
+        let tid = claims["tid"].as_str().unwrap_or_default();
+        // A tenant id is a GUID; anything else could smuggle path segments.
+        let tid_ok = !tid.is_empty() && tid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        tid_ok && iss == expected.replace("{tenantid}", tid)
+    } else {
+        iss == expected
+            || expected.strip_prefix("https://") == Some(iss) && iss == "accounts.google.com"
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::IdToken("unexpected issuer".into()))
+    }
+}
+
 /// Reads and validates the claims of an `id_token` received directly from the
 /// token endpoint over TLS with client authentication. Per OpenID Connect Core
 /// §3.1.3.7 the TLS server validation may be used instead of a signature check
 /// in this case; issuer, audience, expiry and nonce are still verified.
 pub(crate) fn id_token_claims(
     id_token: &str,
-    issuers: &[&str],
+    issuer: Option<&str>,
     client_id: &str,
     nonce: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -153,13 +177,7 @@ pub(crate) fn id_token_claims(
         .map_err(|e| Error::IdToken(e.to_string()))?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes)?;
 
-    if !issuers.is_empty()
-        && !claims["iss"]
-            .as_str()
-            .is_some_and(|iss| issuers.contains(&iss))
-    {
-        return Err(Error::IdToken("unexpected issuer".into()));
-    }
+    check_issuer(&claims, issuer)?;
     let aud_ok = match &claims["aud"] {
         serde_json::Value::String(a) => a == client_id,
         serde_json::Value::Array(a) => a.iter().any(|v| v.as_str() == Some(client_id)),
@@ -209,17 +227,17 @@ mod tests {
             "iss": ISSUER, "aud": "app", "exp": now() + 600, "nonce": "n", "sub": "001"
         }));
         assert_eq!(
-            id_token_claims(&t, &[ISSUER], "app", Some("n")).unwrap()["sub"],
+            id_token_claims(&t, Some(ISSUER), "app", Some("n")).unwrap()["sub"],
             "001"
         );
-        assert!(id_token_claims(&t, &[ISSUER], "other", Some("n")).is_err());
-        assert!(id_token_claims(&t, &[ISSUER], "app", Some("x")).is_err());
-        assert!(id_token_claims(&t, &["evil"], "app", Some("n")).is_err());
+        assert!(id_token_claims(&t, Some(ISSUER), "other", Some("n")).is_err());
+        assert!(id_token_claims(&t, Some(ISSUER), "app", Some("x")).is_err());
+        assert!(id_token_claims(&t, Some("evil"), "app", Some("n")).is_err());
     }
 
     #[test]
     fn rejects_expired() {
         let t = token(serde_json::json!({ "iss": ISSUER, "aud": "app", "exp": 1 }));
-        assert!(id_token_claims(&t, &[ISSUER], "app", None).is_err());
+        assert!(id_token_claims(&t, Some(ISSUER), "app", None).is_err());
     }
 }

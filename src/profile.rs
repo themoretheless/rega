@@ -31,8 +31,7 @@ pub(crate) async fn fetch(
 
     // OIDC providers: validate the id_token once (binds the response to this
     // login attempt via nonce) and, when it already carries the profile, skip
-    // the userinfo round-trip. Microsoft/GitLab issuers depend on the tenant or
-    // host, so only audience/expiry/nonce are enforced for them.
+    // the userinfo round-trip.
     if let (Some(nonce), Some(id_token)) = (pending.nonce.as_deref(), token.id_token.as_deref()) {
         let claims = id_token_claims(http, cfg, jwks, id_token, Some(nonce)).await?;
         // Google always includes the profile; Microsoft and GitLab only when the
@@ -99,14 +98,13 @@ async fn id_token_claims(
     id_token: &str,
     nonce: Option<&str>,
 ) -> Result<Value> {
+    let issuer = cfg.endpoints.issuer.as_deref();
     match jwks.filter(|_| cfg.verify_signatures) {
         Some(jwks) => {
-            jwks.verify(http, cfg.provider, id_token, &cfg.client_id, nonce)
+            jwks.verify(http, issuer, id_token, &cfg.client_id, nonce)
                 .await
         }
-        // Microsoft/GitLab issuers depend on the tenant or host, so only
-        // audience/expiry/nonce are enforced for them.
-        None => apple::id_token_claims(id_token, cfg.provider.issuers(), &cfg.client_id, nonce),
+        None => apple::id_token_claims(id_token, issuer, &cfg.client_id, nonce),
     }
 }
 
@@ -129,18 +127,15 @@ pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {
         ),
         // Microsoft does not guarantee ownership of the `email` claim.
         Provider::Microsoft => (id(&p["sub"]), s(&p["email"]), false, s(&p["name"]), None),
-        // Facebook only returns confirmed emails.
-        Provider::Facebook => {
-            let email = s(&p["email"]);
-            let verified = email.is_some();
-            (
-                id(&p["id"]),
-                email,
-                verified,
-                s(&p["name"]),
-                s(&p["picture"]["data"]["url"]),
-            )
-        }
+        // Facebook gives no verification flag, so the address is never trusted
+        // for automatic account linking.
+        Provider::Facebook => (
+            id(&p["id"]),
+            s(&p["email"]),
+            false,
+            s(&p["name"]),
+            s(&p["picture"]["data"]["url"]),
+        ),
         Provider::GitHub => (
             id(&p["id"]),
             s(&p["email"]),
@@ -150,12 +145,10 @@ pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {
         ),
         Provider::X => {
             let d = &p["data"];
-            let email = s(&d["confirmed_email"]);
-            let verified = email.is_some();
             (
                 id(&d["id"]),
-                email,
-                verified,
+                s(&d["confirmed_email"]),
+                false,
                 s(&d["name"]),
                 s(&d["profile_image_url"]),
             )
@@ -179,18 +172,15 @@ pub fn map_profile(provider: Provider, p: Value) -> Result<ExternalIdentity> {
                 avatar,
             )
         }
-        // Yandex accounts only expose confirmed addresses.
         Provider::Yandex => {
-            let email = s(&p["default_email"]);
-            let verified = email.is_some();
             let avatar = (p["is_avatar_empty"] != Value::Bool(true))
                 .then(|| s(&p["default_avatar_id"]))
                 .flatten()
                 .map(|a| format!("https://avatars.yandex.net/get-yapic/{a}/islands-200"));
             (
                 id(&p["id"]),
-                email,
-                verified,
+                s(&p["default_email"]),
+                false,
                 s(&p["real_name"]).or_else(|| s(&p["display_name"])),
                 avatar,
             )
@@ -433,7 +423,17 @@ mod tests {
         );
         assert!(d.email_verified);
         let y = map_profile(Provider::Yandex, json!({"id":"5","default_email":"y@ya.ru","default_avatar_id":"a","is_avatar_empty":false})).unwrap();
-        assert!(y.email_verified && y.avatar_url.is_some());
+        // Yandex, X and Facebook send no verification flag: never auto-linked.
+        assert!(!y.email_verified && y.avatar_url.is_some());
+        let x = map_profile(
+            Provider::X,
+            json!({"data":{"id":"3","confirmed_email":"x@x.test"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            (x.email.as_deref(), x.email_verified),
+            (Some("x@x.test"), false)
+        );
         let x = map_profile(Provider::X, json!({"data":{"id":"3","name":"X"}})).unwrap();
         assert_eq!((x.subject.as_str(), x.email), ("3", None));
         let f = map_profile(
@@ -443,7 +443,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             (f.email_verified, f.avatar_url.as_deref()),
-            (true, Some("u"))
+            (false, Some("u"))
         );
     }
 

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Security review (second pass)
+- `Debug` no longer prints secrets: client secret, access/refresh/id tokens, `state`, `nonce`, PKCE verifier
+  and callback values are redacted.
+- **Behaviour change:** Facebook, Yandex and X emails are no longer treated as verified (those providers send
+  no verification flag), so they do not auto-link to an existing account. Set `identity.email_verified`
+  yourself to opt back in.
+- The `id_token` issuer is now checked for Microsoft (per-tenant) and GitLab even without signature
+  verification. **API change:** `Endpoints` gained the `issuer` field.
+- Callbacks with a repeated parameter are rejected (`Callback::duplicate`).
+- axum: the state cookie is scoped to the real mount point, so nested routers work; sign-in and login
+  failures are logged through `tracing`.
+
 ### Integrations
 - `axum` feature: `AuthRoutes` with `/auth/{provider}` and `/auth/{provider}/callback`
   (GET + POST for Apple), state in an encrypted `HttpOnly` cookie, safe error responses.

@@ -16,6 +16,7 @@ pub fn verify_login(
     bot_token: &str,
     max_age_secs: u64,
 ) -> Result<ExternalIdentity> {
+    data.reject_duplicates()?;
     let hash = data.get("hash").ok_or_else(|| invalid("missing hash"))?;
 
     let mut fields: Vec<(&str, &str)> = data.iter().filter(|(k, _)| *k != "hash").collect();

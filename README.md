@@ -10,12 +10,12 @@ Rust-библиотека для регистрации и входа через
 | Google | `Google` | `openid email profile` | ✓ | по `email_verified` |
 | Apple | `Apple` | `name email` (`form_post`) | — | по `email_verified` в `id_token` |
 | Microsoft | `Microsoft` | `openid email profile` | ✓ | никогда (MS не гарантирует) |
-| Facebook | `Facebook` | `email,public_profile` | ✓ | да, если email отдан |
+| Facebook | `Facebook` | `email,public_profile` | ✓ | нет (Facebook не отдаёт флаг подтверждения) |
 | GitHub | `GitHub` | `read:user user:email` | ✓ | primary+verified из `/user/emails` |
-| X (Twitter) | `X` | `users.read tweet.read` | ✓ | `confirmed_email` (нужен скоуп `users.email`) |
+| X (Twitter) | `X` | `users.read tweet.read` | ✓ | нет; email приходит только со скоупом `users.email` |
 | LinkedIn | `LinkedIn` | `openid profile email` | — | по `email_verified` |
 | Discord | `Discord` | `identify email` | — | по `verified` |
-| Яндекс ID | `Yandex` | `login:email login:info login:avatar` | ✓ | да, если email отдан |
+| Яндекс ID | `Yandex` | `login:email login:info login:avatar` | ✓ | нет (флага подтверждения нет) |
 | VK ID | `Vk` | `vkid.personal_info email` | ✓ | нет |
 | GitLab | `GitLab` | `openid profile email` | ✓ | по `email_verified` |
 | Amazon | `Amazon` | `profile` | ✓ | нет |
@@ -117,6 +117,9 @@ let app = rega::axum::AuthRoutes::new(oauth, accounts, cookie_key)
 
 Своё хранилище — реализуйте трейт `AccountStore`; пара `(provider, subject)` должна быть уникальной
 (при нарушении возвращайте `StoreError::Conflict` — так обрабатываются гонки при первом входе).
+
+Если вы сами доверяете email какого-то провайдера (например, Яндекса), выставьте `identity.email_verified = true`
+перед `accounts.sign_in(&identity)` — это осознанное решение приложения, а не умолчание библиотеки.
 
 ## Особенности провайдеров
 

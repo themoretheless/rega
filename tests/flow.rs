@@ -16,6 +16,15 @@ fn endpoints(server: &MockServer, userinfo: Option<&str>, emails: Option<&str>) 
         emails: emails.map(|p| format!("{}{p}", server.uri())),
         jwks: Some(format!("{}/jwks", server.uri())),
         revoke: Some(format!("{}/revoke", server.uri())),
+        issuer: None,
+    }
+}
+
+/// Mock endpoints that keep the provider's real issuer expectation.
+fn endpoints_for(provider: Provider, server: &MockServer, userinfo: Option<&str>) -> Endpoints {
+    Endpoints {
+        issuer: provider.endpoints().issuer,
+        ..endpoints(server, userinfo, None)
     }
 }
 
@@ -255,14 +264,19 @@ async fn oidc_flow(
     userinfo_calls: u64,
 ) -> rega::ExternalIdentity {
     let server = MockServer::start().await;
-    let client =
-        OAuthClient::new().register(
-            ProviderConfig::new(provider, "cid", "s", "https://app.test/cb")
-                .with_endpoints(endpoints(&server, Some("/userinfo"), None)),
-        );
+    let client = OAuthClient::new().register(
+        ProviderConfig::new(provider, "cid", "s", "https://app.test/cb")
+            .with_endpoints(endpoints_for(provider, &server, Some("/userinfo"))),
+    );
     let req = client.authorize(provider).unwrap();
+    let iss = match provider {
+        Provider::Microsoft => {
+            "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0"
+        }
+        _ => "https://gitlab.com",
+    };
     let mut claims = json!({
-        "iss": "https://issuer.test", "aud": "cid", "exp": 4_000_000_000u64, "sub": "s1",
+        "iss": iss, "tid": "11111111-2222-3333-4444-555555555555", "aud": "cid", "exp": 4_000_000_000u64, "sub": "s1",
         "nonce": req.pending.nonce.clone().unwrap(),
     });
     claims
@@ -345,7 +359,7 @@ mod hardening {
         let server = jwks_server().await;
         let client = OAuthClient::new().register(
             ProviderConfig::new(Provider::Google, "web-id", "s", "https://app.test/cb")
-                .with_endpoints(endpoints(&server, None, None)),
+                .with_endpoints(endpoints_for(Provider::Google, &server, None)),
         );
         let claims = json!({
             "iss": "https://accounts.google.com", "aud": "ios-id", "exp": 4_000_000_000u64,
@@ -395,7 +409,7 @@ mod hardening {
         let server = jwks_server().await;
         let client = OAuthClient::new().register(
             ProviderConfig::new(Provider::Google, "gid", "s", "https://app.test/cb")
-                .with_endpoints(endpoints(&server, Some("/userinfo"), None))
+                .with_endpoints(endpoints_for(Provider::Google, &server, Some("/userinfo")))
                 .with_signature_verification(),
         );
         let req = client.authorize(Provider::Google).unwrap();
@@ -525,7 +539,11 @@ mod all_providers {
             "10",
         )
         .await;
-        assert!(i.email_verified);
+        // No verification flag from Facebook: never trusted for auto-linking.
+        assert_eq!(
+            (i.email.as_deref(), i.email_verified),
+            (Some("f@fb.test"), false)
+        );
     }
 
     #[tokio::test]
@@ -727,5 +745,123 @@ mod features {
         assert!(url
             .query_pairs()
             .any(|(k, v)| k == "claims" && v.contains("email_verified")));
+    }
+}
+
+mod rethink {
+    use super::*;
+
+    async fn code_flow_with_claims(
+        provider: Provider,
+        claims: serde_json::Value,
+    ) -> rega::Result<rega::ExternalIdentity> {
+        let server = MockServer::start().await;
+        let client = OAuthClient::new().register(
+            ProviderConfig::new(provider, "cid", "s", "https://app.test/cb")
+                .with_endpoints(endpoints_for(provider, &server, Some("/userinfo"))),
+        );
+        let req = client.authorize(provider).unwrap();
+        let mut claims = claims;
+        claims["aud"] = json!("cid");
+        claims["exp"] = json!(4_000_000_000u64);
+        claims["sub"] = json!("s1");
+        claims["email"] = json!("e@x.test");
+        claims["nonce"] = json!(req.pending.nonce.clone().unwrap());
+        let id_token = format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims.to_string()));
+        Mock::given(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"at","id_token": id_token})),
+            )
+            .mount(&server)
+            .await;
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        client.complete(&cb, &req.pending).await
+    }
+
+    #[tokio::test]
+    async fn issuer_is_checked_without_signature_verification() {
+        let tid = "11111111-2222-3333-4444-555555555555";
+        let ms = |iss: String, tid: &str| {
+            code_flow_with_claims(Provider::Microsoft, json!({"iss": iss, "tid": tid}))
+        };
+        assert!(
+            ms(format!("https://login.microsoftonline.com/{tid}/v2.0"), tid)
+                .await
+                .is_ok()
+        );
+        assert!(ms("https://evil.test/x/v2.0".into(), tid).await.is_err());
+        // A tid that is not a plain id must not be spliced into the expected issuer.
+        assert!(ms(
+            "https://login.microsoftonline.com/a/../b/v2.0".into(),
+            "a/../b"
+        )
+        .await
+        .is_err());
+        assert!(
+            ms(format!("https://login.microsoftonline.com/{tid}/v2.0"), "")
+                .await
+                .is_err()
+        );
+
+        let gl = |iss: &str| code_flow_with_claims(Provider::GitLab, json!({"iss": iss}));
+        assert!(gl("https://gitlab.com").await.is_ok());
+        assert!(gl("https://gitlab.com.evil.test").await.is_err());
+
+        let g = |iss: &str| code_flow_with_claims(Provider::Google, json!({"iss": iss}));
+        assert!(g("accounts.google.com").await.is_ok());
+        assert!(g("https://accounts.google.com").await.is_ok());
+        assert!(g("google.com").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn repeated_callback_parameters_are_rejected() {
+        let client = OAuthClient::new().register(ProviderConfig::new(
+            Provider::GitHub,
+            "c",
+            "s",
+            "https://a/cb",
+        ));
+        let req = client.authorize(Provider::GitHub).unwrap();
+        let cb = Callback::parse(&format!("code=good&state={0}&code=evil", req.pending.state));
+        assert_eq!(cb.duplicate(), Some("code"));
+        let err = client.complete(&cb, &req.pending).await.unwrap_err();
+        assert!(err.to_string().contains("`code` is repeated"), "{err}");
+    }
+
+    #[test]
+    fn debug_output_never_contains_secrets() {
+        let cfg = ProviderConfig::new(Provider::Google, "cid", "TOP-SECRET", "https://a/cb");
+        assert!(!format!("{cfg:?}").contains("TOP-SECRET"));
+
+        let client = OAuthClient::new().register(cfg);
+        assert!(!format!("{client:?}").contains("TOP-SECRET"));
+
+        let req = client.authorize(Provider::Google).unwrap();
+        let shown = format!("{req:?}");
+        for secret in [
+            req.pending.state.as_str(),
+            req.pending.nonce.as_deref().unwrap(),
+            req.pending.code_verifier.as_deref().unwrap(),
+        ] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+
+        let cb = Callback::parse("code=AUTH-CODE&state=STATE-VALUE");
+        let shown = format!("{cb:?}");
+        assert!(
+            shown.contains("code")
+                && !shown.contains("AUTH-CODE")
+                && !shown.contains("STATE-VALUE")
+        );
+
+        let token: rega::TokenResponse = serde_json::from_value(json!({
+            "access_token": "AT-VALUE", "refresh_token": "RT-VALUE", "id_token": "IDT-VALUE", "custom": "EXTRA-VALUE",
+        }))
+        .unwrap();
+        let shown = format!("{token:?}");
+        for secret in ["AT-VALUE", "RT-VALUE", "IDT-VALUE", "EXTRA-VALUE"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
     }
 }
