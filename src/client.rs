@@ -1,15 +1,17 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use url::Url;
 
 use std::sync::Arc;
 
-use crate::apple::{self, AppleKey, AppleSigner};
+use crate::callback::{AuthorizationRequest, Callback, PendingAuth};
+use crate::clock::{Clock, SystemClock};
+use crate::config::{ProviderConfig, REDACTED};
 use crate::jwks::Jwks;
-use crate::provider::{ClientAuth, Endpoints};
-use crate::{pkce, profile, Error, ExternalIdentity, Provider, Result};
+use crate::provider::ClientAuth;
+use crate::spec::{ProviderId, TokenExtra};
+use crate::{pkce, profile, Error, ExternalIdentity, Result};
 
 /// How long a [`PendingAuth`] stays valid.
 const PENDING_TTL_SECS: u64 = 15 * 60;
@@ -17,265 +19,6 @@ const PENDING_TTL_SECS: u64 = 15 * 60;
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Client credential used at the token endpoint. `Debug` never prints the secret.
-#[derive(Clone)]
-pub enum ClientSecret {
-    /// Public client: PKCE only, no secret.
-    None,
-    /// Fixed client secret.
-    Static(String),
-    /// Sign in with Apple: the secret is generated from the `.p8` key and
-    /// cached until shortly before it expires.
-    Apple(AppleSigner),
-}
-
-/// Placeholder printed instead of secret values in `Debug` output.
-const REDACTED: &str = "[redacted]";
-
-impl std::fmt::Debug for ClientSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientSecret::None => f.write_str("None"),
-            ClientSecret::Static(_) => write!(f, "Static({REDACTED})"),
-            ClientSecret::Apple(signer) => f.debug_tuple("Apple").field(signer.key()).finish(),
-        }
-    }
-}
-
-impl ClientSecret {
-    pub(crate) fn static_secret(&self) -> Option<&str> {
-        match self {
-            ClientSecret::Static(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn resolve(&self, client_id: &str) -> Result<Option<String>> {
-        match self {
-            ClientSecret::None => Ok(None),
-            ClientSecret::Static(s) => Ok(Some(s.clone())),
-            ClientSecret::Apple(signer) => signer.client_secret(client_id).map(Some),
-        }
-    }
-}
-
-/// Application registration at a provider.
-#[derive(Debug, Clone)]
-pub struct ProviderConfig {
-    /// Provider this registration belongs to.
-    pub provider: Provider,
-    /// OAuth client id.
-    pub client_id: String,
-    /// Credential for the token endpoint.
-    pub client_secret: ClientSecret,
-    /// Redirect URI registered at the provider.
-    pub redirect_uri: String,
-    /// Requested scopes; defaults to [`Provider::default_scopes`].
-    pub scopes: Vec<String>,
-    /// Provider endpoints; defaults to [`Provider::endpoints`].
-    pub endpoints: Endpoints,
-    /// Extra query parameters for the authorization URL (`prompt`, `hd`, ...).
-    pub authorize_params: Vec<(String, String)>,
-    /// Verify `id_token` signatures against the provider's JWKS during the
-    /// code flow. Off by default: the token comes straight from the token
-    /// endpoint over TLS (OIDC Core §3.1.3.7), and verification costs a
-    /// (cached) key-set download. Tokens passed to
-    /// [`OAuthClient::verify_id_token`] are always verified.
-    pub verify_signatures: bool,
-}
-
-impl ProviderConfig {
-    /// Registration with default scopes and endpoints. An empty secret makes a public (PKCE-only) client.
-    pub fn new(
-        provider: Provider,
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-    ) -> Self {
-        let secret = client_secret.into();
-        Self {
-            provider,
-            client_id: client_id.into(),
-            client_secret: if secret.is_empty() {
-                ClientSecret::None
-            } else {
-                ClientSecret::Static(secret)
-            },
-            redirect_uri: redirect_uri.into(),
-            scopes: provider
-                .default_scopes()
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            endpoints: provider.endpoints(),
-            authorize_params: Vec::new(),
-            verify_signatures: false,
-        }
-    }
-
-    /// Sign in with Apple. `client_id` is the Services ID.
-    pub fn apple(
-        client_id: impl Into<String>,
-        key: AppleKey,
-        redirect_uri: impl Into<String>,
-    ) -> Self {
-        let mut cfg = Self::new(Provider::Apple, client_id, "", redirect_uri);
-        cfg.client_secret = ClientSecret::Apple(AppleSigner::new(key));
-        cfg
-    }
-
-    /// Replaces the requested scopes.
-    pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.scopes = scopes.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Overrides the endpoints (self-hosted GitLab, Microsoft tenant, tests).
-    pub fn with_endpoints(mut self, endpoints: Endpoints) -> Self {
-        self.endpoints = endpoints;
-        self
-    }
-
-    /// Enables JWKS signature verification of `id_token` in the code flow.
-    pub fn with_signature_verification(mut self) -> Self {
-        self.verify_signatures = true;
-        self
-    }
-
-    /// Adds an extra query parameter to the authorization URL.
-    pub fn with_authorize_param(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        self.authorize_params.push((key.into(), value.into()));
-        self
-    }
-}
-
-/// Data that must survive the redirect round-trip (store it in the session or
-/// an encrypted, `HttpOnly` cookie). Never expose it to the browser in clear text:
-/// it contains the PKCE verifier. `Debug` prints none of the secret values.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingAuth {
-    /// Provider the login was started with.
-    pub provider: Provider,
-    /// Anti-CSRF `state` value.
-    pub state: String,
-    /// OIDC `nonce`, for providers that issue an `id_token`.
-    pub nonce: Option<String>,
-    /// PKCE verifier, for providers that support PKCE.
-    pub code_verifier: Option<String>,
-    /// Unix time the attempt was started.
-    pub created_at: u64,
-}
-
-impl std::fmt::Debug for PendingAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingAuth")
-            .field("provider", &self.provider)
-            .field("state", &REDACTED)
-            .field("nonce", &self.nonce.as_ref().map(|_| REDACTED))
-            .field(
-                "code_verifier",
-                &self.code_verifier.as_ref().map(|_| REDACTED),
-            )
-            .field("created_at", &self.created_at)
-            .finish()
-    }
-}
-
-/// Where to send the user, plus the state to keep until the callback.
-/// `Debug` omits the URL query, which carries the `state`.
-#[derive(Clone)]
-pub struct AuthorizationRequest {
-    /// URL to redirect the user to.
-    pub url: Url,
-    /// State to keep until the callback.
-    pub pending: PendingAuth,
-}
-
-impl std::fmt::Debug for AuthorizationRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut url = self.url.clone();
-        url.set_query(None);
-        f.debug_struct("AuthorizationRequest")
-            .field("url", &url.as_str())
-            .field("pending", &self.pending)
-            .finish()
-    }
-}
-
-/// Parameters the provider sent to the redirect URI (query string, or form
-/// body for Apple's `form_post`). `Debug` prints parameter names only: the
-/// values include the authorization code.
-#[derive(Clone, Default)]
-pub struct Callback {
-    params: HashMap<String, String>,
-    /// Names that appeared more than once. A repeated parameter is how
-    /// parameter-pollution attacks make two parsers disagree, so such
-    /// callbacks are rejected rather than resolved first- or last-wins.
-    duplicates: Vec<String>,
-}
-
-impl std::fmt::Debug for Callback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut names: Vec<&str> = self.params.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        f.debug_struct("Callback").field("params", &names).finish()
-    }
-}
-
-impl Callback {
-    /// Value of a callback parameter.
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.params.get(key).map(String::as_str)
-    }
-
-    /// Name of a parameter that was sent more than once, if any.
-    pub fn duplicate(&self) -> Option<&str> {
-        self.duplicates.first().map(String::as_str)
-    }
-
-    pub(crate) fn reject_duplicates(&self) -> Result<()> {
-        match self.duplicate() {
-            Some(name) => Err(Error::InvalidResponse(format!(
-                "callback parameter `{name}` is repeated"
-            ))),
-            None => Ok(()),
-        }
-    }
-
-    /// All parameters, in no particular order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.params.iter().map(|(k, v)| (k.as_str(), v.as_str()))
-    }
-
-    /// Parses a raw query string or `application/x-www-form-urlencoded` body.
-    pub fn parse(query: &str) -> Self {
-        url::form_urlencoded::parse(query.trim_start_matches('?').as_bytes()).collect()
-    }
-}
-
-impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Callback {
-    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
-        let mut callback = Self::default();
-        for (k, v) in iter {
-            match callback.params.entry(k.into()) {
-                Entry::Occupied(seen) => callback.duplicates.push(seen.key().clone()),
-                Entry::Vacant(slot) => {
-                    slot.insert(v.into());
-                }
-            }
-        }
-        callback
-    }
-}
 
 /// Token endpoint response. `Debug` prints no token values.
 #[derive(Clone, Deserialize)]
@@ -318,14 +61,31 @@ impl std::fmt::Debug for TokenResponse {
 }
 
 /// OAuth 2.0 / OIDC client for all configured providers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthClient {
     http: reqwest::Client,
-    providers: HashMap<Provider, ProviderConfig>,
+    clock: Arc<dyn Clock>,
+    providers: HashMap<ProviderId, Registration>,
+}
+
+/// A registered provider with what is derived from its configuration once.
+#[derive(Clone)]
+struct Registration {
+    config: ProviderConfig,
     /// Authorization URL with every per-registration parameter already
     /// encoded; `authorize` only appends the per-request ones.
-    base_urls: HashMap<Provider, std::result::Result<Url, String>>,
-    jwks: HashMap<Provider, Arc<Jwks>>,
+    base_url: std::result::Result<Url, String>,
+    jwks: Option<Arc<Jwks>>,
+}
+
+impl std::fmt::Debug for OAuthClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut providers: Vec<&ProviderId> = self.providers.keys().collect();
+        providers.sort();
+        f.debug_struct("OAuthClient")
+            .field("providers", &providers)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for OAuthClient {
@@ -351,26 +111,34 @@ impl OAuthClient {
     pub fn with_http_client(http: reqwest::Client) -> Self {
         Self {
             http,
+            clock: Arc::new(SystemClock),
             providers: HashMap::new(),
-            base_urls: HashMap::new(),
-            jwks: HashMap::new(),
         }
+    }
+
+    /// Replaces the time source used for the lifetime of a login attempt and
+    /// the expiry of `id_token`s checked without signature verification.
+    /// Meant for tests; signature verification and the Apple-secret and JWKS
+    /// caches keep using the system clock.
+    pub fn with_clock(mut self, clock: impl Clock + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 
     /// Registers (or replaces) a provider.
     pub fn register(mut self, config: ProviderConfig) -> Self {
-        match &config.endpoints.jwks {
-            Some(url) => {
-                self.jwks
-                    .insert(config.provider, Arc::new(Jwks::new(url.clone())));
-            }
-            None => {
-                self.jwks.remove(&config.provider);
-            }
-        }
-        self.base_urls
-            .insert(config.provider, base_authorize_url(&config));
-        self.providers.insert(config.provider, config);
+        let registration = Registration {
+            base_url: base_authorize_url(&config),
+            jwks: config
+                .spec
+                .endpoints
+                .jwks
+                .clone()
+                .map(|url| Arc::new(Jwks::new(url))),
+            config,
+        };
+        self.providers
+            .insert(registration.config.spec.id.clone(), registration);
         self
     }
 
@@ -381,77 +149,60 @@ impl OAuthClient {
     /// have their own (iOS bundle id / Android client id).
     pub async fn verify_id_token(
         &self,
-        provider: Provider,
+        provider: impl Into<ProviderId>,
         id_token: &str,
         audience: Option<&str>,
         nonce: Option<&str>,
     ) -> Result<ExternalIdentity> {
-        let cfg = self.config(provider)?;
-        let jwks = self.jwks.get(&provider).ok_or_else(|| {
+        let reg = self.registration(provider.into())?;
+        let cfg = &reg.config;
+        let jwks = reg.jwks.as_ref().ok_or_else(|| {
             Error::Config(format!(
-                "{provider}: no JWKS endpoint, id_token login is unsupported"
+                "{}: no JWKS endpoint, id_token login is unsupported",
+                cfg.spec.id
             ))
         })?;
         let aud = audience.unwrap_or(&cfg.client_id);
+        let issuer = cfg.spec.endpoints.issuer.as_deref();
         let claims = jwks
-            .verify(
-                &self.http,
-                cfg.endpoints.issuer.as_deref(),
-                id_token,
-                aud,
-                nonce,
-            )
+            .verify(&self.http, issuer, id_token, aud, nonce)
             .await?;
-        match provider {
-            Provider::Apple => profile::map_apple(claims, None),
-            _ => profile::map_profile(provider, claims),
-        }
+        profile::map(&cfg.spec, claims, &Callback::default())
     }
 
     /// Exchanges a refresh token for a new access token.
-    pub async fn refresh(&self, provider: Provider, refresh_token: &str) -> Result<TokenResponse> {
+    pub async fn refresh(
+        &self,
+        provider: impl Into<ProviderId>,
+        refresh_token: &str,
+    ) -> Result<TokenResponse> {
         let cfg = self.config(provider)?;
-        let secret = cfg.client_secret.resolve(&cfg.client_id)?;
-        let mut form: Vec<(&str, &str)> = vec![
+        let form = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", &cfg.client_id),
         ];
-        let mut req = self
-            .http
-            .post(&cfg.endpoints.token)
-            .header("Accept", "application/json");
-        if let Some(secret) = &secret {
-            match provider.client_auth() {
-                ClientAuth::Basic => req = req.basic_auth(&cfg.client_id, Some(secret)),
-                ClientAuth::Post => form.push(("client_secret", secret)),
-            }
-        }
-        let body = read_json(req.form(&form).send().await?).await?;
+        let resp = self.client_request(cfg, &cfg.spec.endpoints.token, form)?;
+        let body = read_json(resp.send().await?).await?;
         Ok(serde_json::from_value(body)?)
     }
 
     /// Revokes an access or refresh token (RFC 7009). Apple requires this when
     /// a user deletes their account.
-    pub async fn revoke(&self, provider: Provider, token: &str, hint: Option<&str>) -> Result<()> {
+    pub async fn revoke(
+        &self,
+        provider: impl Into<ProviderId>,
+        token: &str,
+        hint: Option<&str>,
+    ) -> Result<()> {
         let cfg = self.config(provider)?;
-        let url =
-            cfg.endpoints.revoke.as_deref().ok_or_else(|| {
-                Error::Config(format!("{provider}: token revocation is unsupported"))
-            })?;
-        let secret = cfg.client_secret.resolve(&cfg.client_id)?;
-        let mut form: Vec<(&str, &str)> = vec![("token", token), ("client_id", &cfg.client_id)];
+        let url = cfg.spec.endpoints.revoke.as_deref().ok_or_else(|| {
+            Error::Config(format!("{}: token revocation is unsupported", cfg.spec.id))
+        })?;
+        let mut form = vec![("token", token)];
         if let Some(hint) = hint {
             form.push(("token_type_hint", hint));
         }
-        let mut req = self.http.post(url);
-        if let Some(secret) = &secret {
-            match provider.client_auth() {
-                ClientAuth::Basic => req = req.basic_auth(&cfg.client_id, Some(secret)),
-                ClientAuth::Post => form.push(("client_secret", secret)),
-            }
-        }
-        let resp = req.form(&form).send().await?;
+        let resp = self.client_request(cfg, url, form)?.send().await?;
         if resp.status().is_success() {
             return Ok(());
         }
@@ -459,34 +210,40 @@ impl OAuthClient {
     }
 
     /// Registered providers.
-    pub fn providers(&self) -> impl Iterator<Item = Provider> + '_ {
-        self.providers.keys().copied()
+    pub fn providers(&self) -> impl Iterator<Item = &ProviderId> + '_ {
+        self.providers.keys()
     }
 
     /// Registration of `provider`.
-    pub fn config(&self, provider: Provider) -> Result<&ProviderConfig> {
-        self.providers
-            .get(&provider)
-            .ok_or(Error::NotConfigured(provider))
+    pub fn config(&self, provider: impl Into<ProviderId>) -> Result<&ProviderConfig> {
+        self.registration(provider.into()).map(|r| &r.config)
+    }
+
+    fn registration(&self, provider: ProviderId) -> Result<&Registration> {
+        match self.providers.get(&provider) {
+            Some(registration) => Ok(registration),
+            None => Err(Error::NotConfigured(provider)),
+        }
     }
 
     /// Step 1: build the URL to redirect the user to.
-    pub fn authorize(&self, provider: Provider) -> Result<AuthorizationRequest> {
-        if provider == Provider::Telegram {
-            return Err(Error::Config(
-                "Telegram uses the Login Widget; verify it with rega::telegram::verify_login"
-                    .into(),
-            ));
+    pub fn authorize(&self, provider: impl Into<ProviderId>) -> Result<AuthorizationRequest> {
+        let reg = self.registration(provider.into())?;
+        let spec = &reg.config.spec;
+        if !spec.redirect_flow {
+            return Err(Error::Config(format!(
+                "{} has no redirect flow (Telegram: use rega::telegram::verify_login)",
+                spec.id
+            )));
         }
-        let mut url = match self.base_urls.get(&provider) {
-            Some(Ok(url)) => url.clone(),
-            Some(Err(e)) => return Err(Error::Config(format!("authorize endpoint: {e}"))),
-            None => return Err(Error::NotConfigured(provider)),
+        let mut url = match &reg.base_url {
+            Ok(url) => url.clone(),
+            Err(e) => return Err(Error::Config(format!("authorize endpoint: {e}"))),
         };
 
         let [state, nonce, code_verifier] = pkce::random_tokens::<3>();
-        let nonce = provider.uses_nonce().then_some(nonce);
-        let code_verifier = provider.supports_pkce().then_some(code_verifier);
+        let nonce = spec.nonce.then_some(nonce);
+        let code_verifier = spec.pkce.then_some(code_verifier);
 
         {
             let mut q = url.query_pairs_mut();
@@ -503,11 +260,11 @@ impl OAuthClient {
         Ok(AuthorizationRequest {
             url,
             pending: PendingAuth {
-                provider,
+                provider: spec.id.clone(),
                 state,
                 nonce,
                 code_verifier,
-                created_at: apple::now(),
+                created_at: self.clock.now(),
             },
         })
     }
@@ -533,17 +290,19 @@ impl OAuthClient {
         if pending.state.is_empty() || !pkce::constant_time_eq(state, &pending.state) {
             return Err(Error::StateMismatch);
         }
-        if apple::now().saturating_sub(pending.created_at) > PENDING_TTL_SECS {
+        let now = self.clock.now();
+        if now.saturating_sub(pending.created_at) > PENDING_TTL_SECS {
             return Err(Error::Expired);
         }
         let code = callback
             .get("code")
             .filter(|c| !c.is_empty())
             .ok_or(Error::MissingCode)?;
-        let cfg = self.config(pending.provider)?;
+        let reg = self.registration(pending.provider.clone())?;
+        let cfg = &reg.config;
         let token = self.exchange_code(cfg, code, callback, pending).await?;
-        let jwks = self.jwks.get(&pending.provider).map(Arc::as_ref);
-        profile::fetch(&self.http, cfg, &token, callback, pending, jwks).await
+        let jwks = reg.jwks.as_deref();
+        profile::fetch(&self.http, cfg, &token, callback, pending, jwks, now).await
     }
 
     async fn exchange_code(
@@ -553,63 +312,67 @@ impl OAuthClient {
         callback: &Callback,
         pending: &PendingAuth,
     ) -> Result<TokenResponse> {
-        let secret = cfg.client_secret.resolve(&cfg.client_id)?;
         let mut form: Vec<(&str, &str)> = Vec::with_capacity(8);
         form.extend([
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", cfg.redirect_uri.as_str()),
-            ("client_id", cfg.client_id.as_str()),
         ]);
         if let Some(v) = &pending.code_verifier {
             form.push(("code_verifier", v));
         }
-        if cfg.provider == Provider::Vk {
+        match cfg.spec.token_extra {
+            TokenExtra::None => {}
             // VK ID binds the code to the device id returned in the callback.
-            form.push(("device_id", callback.get("device_id").unwrap_or_default()));
-            form.push(("state", &pending.state));
+            TokenExtra::DeviceIdAndState => {
+                form.push(("device_id", callback.get("device_id").unwrap_or_default()));
+                form.push(("state", &pending.state));
+            }
         }
+        let req = self.client_request(cfg, &cfg.spec.endpoints.token, form)?;
+        let body = read_json(req.send().await?).await?;
+        Ok(serde_json::from_value(body)?)
+    }
 
-        let mut req = self
-            .http
-            .post(&cfg.endpoints.token)
-            .header("Accept", "application/json");
+    /// A form POST carrying the client's credentials the way the provider
+    /// expects them (HTTP Basic or form fields).
+    fn client_request<'a>(
+        &self,
+        cfg: &'a ProviderConfig,
+        url: &str,
+        form: Vec<(&'a str, &'a str)>,
+    ) -> Result<reqwest::RequestBuilder> {
+        let secret = cfg.client_secret.resolve(&cfg.client_id)?;
+        let mut req = self.http.post(url).header("Accept", "application/json");
+        // Re-borrow at a lifetime short enough to also hold the resolved secret.
+        let mut form: Vec<(&str, &str)> = form.into_iter().collect();
+        form.push(("client_id", &cfg.client_id));
         if let Some(secret) = &secret {
-            match cfg.provider.client_auth() {
+            match cfg.spec.client_auth {
                 ClientAuth::Basic => req = req.basic_auth(&cfg.client_id, Some(secret)),
                 ClientAuth::Post => form.push(("client_secret", secret)),
             }
         }
-
-        let body = read_json(req.form(&form).send().await?).await?;
-        Ok(serde_json::from_value(body)?)
+        Ok(req.form(&form))
     }
 }
 
 /// Authorization URL with the parameters that never change per request.
 fn base_authorize_url(cfg: &ProviderConfig) -> std::result::Result<Url, String> {
-    let provider = cfg.provider;
-    let mut url = Url::parse(&cfg.endpoints.authorize).map_err(|e| e.to_string())?;
+    let spec = &cfg.spec;
+    let mut url = Url::parse(&spec.endpoints.authorize).map_err(|e| e.to_string())?;
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("response_type", "code")
             .append_pair("client_id", &cfg.client_id)
             .append_pair("redirect_uri", &cfg.redirect_uri);
         if !cfg.scopes.is_empty() {
-            q.append_pair("scope", &cfg.scopes.join(provider.scope_separator()));
+            q.append_pair("scope", &cfg.scopes.join(&spec.scope_separator));
         }
-        if provider == Provider::Twitch {
-            // Twitch only returns these userinfo claims when asked for explicitly.
-            q.append_pair(
-                "claims",
-                r#"{"userinfo":{"email":null,"email_verified":null,"picture":null,"preferred_username":null}}"#,
-            );
-        }
-        if provider == Provider::Apple && !cfg.scopes.is_empty() {
-            // Apple requires form_post whenever name/email scopes are requested.
+        if spec.form_post {
             q.append_pair("response_mode", "form_post");
         }
-        for (k, v) in &cfg.authorize_params {
+        for (k, v) in spec.authorize_params.iter().chain(&cfg.authorize_params) {
             q.append_pair(k, v);
         }
     }
@@ -661,6 +424,7 @@ pub(crate) async fn read_json(mut resp: reqwest::Response) -> Result<serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Provider;
 
     fn client() -> OAuthClient {
         Provider::ALL.into_iter().fold(OAuthClient::new(), |c, p| {

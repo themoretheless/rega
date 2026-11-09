@@ -1,9 +1,9 @@
 [package]
 name = "rega"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Social login & account registration via Google, Apple, Microsoft, GitHub, Facebook, X, LinkedIn, Discord, Yandex, VK, GitLab, Amazon"
+description = "Social login and account linking: 19 built-in OAuth 2.0 / OpenID Connect providers plus your own"
 license = "MIT"
 repository = "https://github.com/themoretheless/rega"
 keywords = ["oauth2", "oidc", "login", "auth", "social"]
@@ -41,13 +41,17 @@ cookie = ["dep:aes-gcm"]
 postgres = ["dep:sqlx"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 wiremock = "0.6"
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
-axum = { version = "0.8", default-features = false, features = ["form", "query", "original-uri"] }
+axum = { version = "0.8", default-features = false, features = ["form", "query", "original-uri", "tokio", "http1"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 criterion = { version = "0.5", default-features = false, features = ["async_tokio"] }
+
+[[example]]
+name = "axum_login"
+required-features = ["axum"]
 
 [[bench]]
 name = "hot_paths"

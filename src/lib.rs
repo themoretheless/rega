@@ -42,10 +42,14 @@ mod account;
 mod apple;
 #[cfg(feature = "axum")]
 pub mod axum;
+mod callback;
 mod client;
+mod clock;
+mod config;
 #[cfg(feature = "cookie")]
 mod cookie;
 mod error;
+mod id_token;
 mod identity;
 mod jwks;
 mod pkce;
@@ -53,19 +57,21 @@ mod pkce;
 mod postgres;
 pub mod profile;
 mod provider;
+mod spec;
 pub mod telegram;
 
 pub use account::{
     AccountError, AccountStore, Accounts, ExternalLogin, InMemoryStore, LinkPolicy, NewUser,
-    SignInOutcome, StoreError, UserId,
+    SignInOutcome, StoreError,
 };
 pub use apple::{AppleKey, AppleSigner};
-pub use client::{
-    AuthorizationRequest, Callback, ClientSecret, OAuthClient, PendingAuth, ProviderConfig,
-    TokenResponse,
-};
+pub use callback::{AuthorizationRequest, Callback, PendingAuth};
+pub use client::{OAuthClient, TokenResponse};
+pub use clock::{Clock, SystemClock};
+pub use config::{ClientSecret, ProviderConfig};
 pub use error::{Error, Result};
 pub use identity::ExternalIdentity;
 #[cfg(feature = "postgres")]
 pub use postgres::{PgAccountStore, SCHEMA as POSTGRES_SCHEMA};
 pub use provider::{ClientAuth, Endpoints, Provider};
+pub use spec::{EmailList, ProfileMapper, ProviderId, ProviderSpec, TokenExtra, UserinfoAuth};

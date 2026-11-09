@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (unreleased)
+
+### Custom providers and a data-driven provider model (breaking)
+- `ProviderSpec` describes a provider completely; built-ins are one table. `ProviderSpec::oidc` /
+  `ProviderSpec::oauth2` + `ProviderConfig::custom` register your own provider under its own `ProviderId`.
+- `ProviderId` replaces the `Provider` enum in `ExternalIdentity`, `ExternalLogin`, `PendingAuth`,
+  `Error::NotConfigured` and `AccountError::LinkedToAnotherUser`. `ProviderConfig.provider` / `.endpoints`
+  moved into `ProviderConfig.spec`.
+- `AccountStore::register` creates a user and its first login atomically (replaces `create_user`): a lost
+  race no longer leaves a user without a login. `AccountStore::UserId` is an associated type (`i64` for
+  `PgAccountStore`); `SignInOutcome` and `axum::SignedIn` are generic over it.
+- `Error` is `#[non_exhaustive]` and no longer exposes `reqwest`, `serde_json` or `jsonwebtoken` types
+  (`Http`/`Json`/`Jwt` → `Network`/`InvalidResponse`/`IdToken`). `Provider` is `#[non_exhaustive]`.
+- `Clock` + `OAuthClient::with_clock` for the login-attempt lifetime.
+- `examples/axum_login.rs`: runnable server for testing against real providers.
+- Migration notes: see "Миграция 0.1 → 0.2" in the README.
+
 
 ### Security review (second pass)
 - `Debug` no longer prints secrets: client secret, access/refresh/id tokens, `state`, `nonce`, PKCE verifier

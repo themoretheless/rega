@@ -28,8 +28,25 @@ Rust-библиотека для регистрации и входа через
 | Telegram | `Telegram` | Login Widget, не OAuth | — | email не отдаётся |
 
 Эндпоинты можно переопределить через `ProviderConfig::with_endpoints`. Готовые хелперы:
-`Endpoints::microsoft_tenant("contoso.onmicrosoft.com")`, `Endpoints::gitlab("https://git.example.com")`
-и `Endpoints::discover(&http, issuer)` — любой OpenID Connect провайдер (Keycloak, Auth0, Okta, Zitadel…).
+`Endpoints::microsoft_tenant("contoso.onmicrosoft.com")`, `Endpoints::gitlab("https://git.example.com")`.
+
+### Свой провайдер
+
+Любой OpenID Connect сервер (Keycloak, Auth0, Okta, Zitadel…) подключается как отдельный провайдер со своим
+идентификатором — он же попадает в базу и в маршрут `/auth/keycloak`:
+
+```rust
+let endpoints = Endpoints::discover(&reqwest::Client::new(), "https://sso.example.com/realms/acme").await?;
+let oauth = OAuthClient::new().register(
+    ProviderConfig::custom(ProviderSpec::oidc("keycloak", endpoints), CLIENT_ID, SECRET, REDIRECT)
+        .with_signature_verification(),
+);
+let req = oauth.authorize("keycloak")?;
+```
+
+Провайдер без OpenID Connect — `ProviderSpec::oauth2(id, endpoints, ProfileMapper::Custom(my_fn))`: вы задаёте
+эндпоинты и функцию, которая превращает JSON профиля в `ExternalIdentity`. Остальные особенности (способ
+аутентификации клиента, PKCE, формат запроса профиля) — публичные поля `ProviderSpec`.
 
 ## Cargo features
 
@@ -59,7 +76,7 @@ let oauth = OAuthClient::new()
         "https://app.example/auth/apple/callback",
     ));
 
-let accounts = Accounts::new(InMemoryStore::new()); // замените на свою реализацию AccountStore
+let accounts = Accounts::new(InMemoryStore::new()); // или PgAccountStore / своя реализация AccountStore
 
 // 1. GET /auth/{provider} — редирект на провайдера
 let req = oauth.authorize(Provider::Google)?;
@@ -115,11 +132,26 @@ let app = rega::axum::AuthRoutes::new(oauth, accounts, cookie_key)
   через провайдера, где можно указать чужой email.
 * `LinkPolicy::Never` — всегда новая учётка, привязка только явно через `Accounts::link`.
 
-Своё хранилище — реализуйте трейт `AccountStore`; пара `(provider, subject)` должна быть уникальной
-(при нарушении возвращайте `StoreError::Conflict` — так обрабатываются гонки при первом входе).
+Своё хранилище — реализуйте трейт `AccountStore`. Тип идентификатора пользователя задаёте вы
+(`type UserId`: `i64` у `PgAccountStore`, `String` у `InMemoryStore`). Пара `(provider, subject)` должна быть
+уникальной, а `register` — атомарным: пользователь и его первый логин создаются вместе или не создаются вовсе
+(при занятом логине возвращайте `StoreError::Conflict` — так обрабатываются гонки при первом входе).
 
 Если вы сами доверяете email какого-то провайдера (например, Яндекса), выставьте `identity.email_verified = true`
 перед `accounts.sign_in(&identity)` — это осознанное решение приложения, а не умолчание библиотеки.
+
+## Проверка на настоящих провайдерах
+
+Тесты библиотеки ходят на mock-сервер. Чтобы проверить вход вживую, есть запускаемый пример:
+
+```sh
+GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=... cargo run --example axum_login --features axum
+```
+
+Откройте <http://localhost:3000>. Ссылка появляется для каждого провайдера, у которого заданы
+`<ИМЯ>_CLIENT_ID` и `<ИМЯ>_CLIENT_SECRET` (`GOOGLE`, `GITHUB`, `YANDEX`, `MICROSOFT`, `DISCORD`…), а также
+для своего OIDC-сервера через `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET`. В консоли провайдера
+укажите redirect URI `http://localhost:3000/auth/<имя>/callback`.
 
 ## Особенности провайдеров
 
@@ -129,6 +161,8 @@ let app = rega::axum::AuthRoutes::new(oauth, accounts, cookie_key)
 * **id_token** (Google, Apple, Microsoft, GitLab, Twitch, Slack) проверяется по `iss`/`aud`/`exp`/`nonce`. Подпись в веб-входе по умолчанию не проверяется (включается `with_signature_verification`), в `verify_id_token` — проверяется всегда:
   токен получен напрямую с token endpoint по TLS с аутентификацией клиента (OIDC Core §3.1.3.7).
 * **VK ID** — `device_id` из callback автоматически передаётся при обмене кода.
+* **X** — email отдаётся только приложениям с доступом к нему: запросите скоуп явно —
+  `ProviderConfig::new(Provider::X, …).with_scopes(["users.read", "tweet.read", "users.email"])`.
 * **GitHub** — ошибки приходят как `200 OK` с `{"error": ...}`, библиотека это обрабатывает; `/user` и `/user/emails` запрашиваются параллельно.
 * **Google, Microsoft, GitLab** — профиль берётся из `id_token`, без отдельного запроса к userinfo (MS/GitLab — если токен содержит `email`).
 
@@ -145,6 +179,19 @@ let app = rega::axum::AuthRoutes::new(oauth, accounts, cookie_key)
 | `verify_id_token` (JWKS из кэша, ES256) | — | 73 µs |
 
 Сеть: Google, Microsoft и GitLab — на 1 HTTP-запрос меньше (профиль из `id_token`, у MS/GitLab — если в нём есть `email`, иначе userinfo), GitHub — 2 запроса профиля параллельно.
+
+## Миграция 0.1 → 0.2
+
+* Провайдер в `ExternalIdentity`, `ExternalLogin`, `PendingAuth` — теперь `ProviderId` (строка), а не enum
+  `Provider`. Сравнение `identity.provider == Provider::Google` работает; для `match` используйте
+  `identity.provider.builtin()`. В JSON и в базе это тот же текст, что `Provider::as_str()`.
+* `ProviderConfig`: поля `provider` и `endpoints` переехали в `config.spec` (`config.provider()`,
+  `config.spec.endpoints`); `with_endpoints` работает как раньше.
+* `AccountStore`: вместо `create_user` — атомарный `register(user, login)`; появился `type UserId`.
+  `SignInOutcome<U>` и `axum::SignedIn<U>` параметризованы этим типом. У `PgAccountStore` id — `i64`.
+* `Error`: варианты `Http`, `Json`, `Jwt` заменены на `Network`, `InvalidResponse`, `IdToken`; enum помечен
+  `#[non_exhaustive]` — в `match` нужна ветка `_`. То же для `Provider`.
+* `OAuthClient::providers()` возвращает `&ProviderId`.
 
 ## Разработка
 

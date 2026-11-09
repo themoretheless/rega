@@ -76,7 +76,7 @@ async fn github_registers_and_links_google_by_email() {
     assert!(matches!(user, SignInOutcome::Registered(_)));
 
     let mut google = identity.clone();
-    google.provider = Provider::Google;
+    google.provider = Provider::Google.into();
     google.subject = "1097".into();
     assert_eq!(
         accounts.sign_in(&google).await.unwrap(),
@@ -863,5 +863,234 @@ mod rethink {
         for secret in ["AT-VALUE", "RT-VALUE", "IDT-VALUE", "EXTRA-VALUE"] {
             assert!(!shown.contains(secret), "{shown}");
         }
+    }
+}
+
+mod custom_provider {
+    use super::*;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    use rega::{ProfileMapper, ProviderId, ProviderSpec};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    fn signed(claims: &serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("test-kid".into());
+        let key = EncodingKey::from_ec_pem(include_bytes!("apple_test_key.p8")).unwrap();
+        jsonwebtoken::encode(&header, claims, &key).unwrap()
+    }
+
+    /// A self-hosted OpenID Connect server: discovery -> authorize -> callback
+    /// -> signed id_token -> identity, under an id rega has never heard of.
+    #[tokio::test]
+    async fn own_oidc_provider_end_to_end() {
+        let server = MockServer::start().await;
+        let issuer = format!("{}/realms/acme", server.uri());
+        Mock::given(path("/realms/acme/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/auth"),
+                "token_endpoint": format!("{issuer}/token"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
+                "jwks_uri": format!("{issuer}/certs"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/realms/acme/certs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(include_str!("test_jwks.json"), "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let endpoints = Endpoints::discover(&reqwest::Client::new(), &issuer)
+            .await
+            .unwrap();
+        let spec = ProviderSpec::oidc("Keycloak", endpoints);
+        assert_eq!(spec.id.as_str(), "keycloak");
+        let client = OAuthClient::new().register(
+            ProviderConfig::custom(spec, "web", "s3cret", "https://app.test/cb")
+                .with_signature_verification(),
+        );
+        assert_eq!(
+            client
+                .providers()
+                .map(ProviderId::as_str)
+                .collect::<Vec<_>>(),
+            ["keycloak"]
+        );
+
+        let req = client.authorize("keycloak").unwrap();
+        let q: std::collections::HashMap<_, _> = req.url.query_pairs().into_owned().collect();
+        assert!(req.url.as_str().starts_with(&format!("{issuer}/auth?")));
+        assert_eq!(q["scope"], "openid email profile");
+        assert!(q.contains_key("code_challenge") && q.contains_key("nonce"));
+
+        let claims = json!({
+            "iss": issuer, "aud": "web", "exp": 4_000_000_000u64, "sub": "kc-7",
+            "email": "Dev@Acme.test", "email_verified": true, "preferred_username": "dev",
+            "nonce": req.pending.nonce.clone().unwrap(),
+        });
+        Mock::given(method("POST"))
+            .and(path("/realms/acme/token"))
+            .and(body_string_contains("client_secret=s3cret"))
+            .and(body_string_contains("code_verifier="))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"at","id_token": signed(&claims)})),
+            )
+            .mount(&server)
+            .await;
+
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        let identity = client.complete(&cb, &req.pending).await.unwrap();
+        assert_eq!(identity.provider.as_str(), "keycloak");
+        assert_eq!(identity.provider.builtin(), None);
+        assert_eq!(
+            (
+                identity.subject.as_str(),
+                identity.email.as_deref(),
+                identity.email_verified,
+                identity.name.as_deref()
+            ),
+            ("kc-7", Some("dev@acme.test"), true, Some("dev"))
+        );
+
+        // A token from another realm must not be accepted.
+        let req = client.authorize("keycloak").unwrap();
+        let mut evil = claims.clone();
+        evil["iss"] = json!(format!("{}/realms/other", server.uri()));
+        evil["nonce"] = json!(req.pending.nonce.clone().unwrap());
+        server.reset().await;
+        Mock::given(path("/realms/acme/certs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(include_str!("test_jwks.json"), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/realms/acme/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"at","id_token": signed(&evil)})),
+            )
+            .mount(&server)
+            .await;
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        assert!(matches!(
+            client.complete(&cb, &req.pending).await,
+            Err(rega::Error::IdToken(_))
+        ));
+
+        // The custom login is stored and found again under its own id.
+        let accounts = Accounts::new(InMemoryStore::new());
+        let first = accounts.sign_in(&identity).await.unwrap();
+        assert!(matches!(first, SignInOutcome::Registered(_)));
+        assert_eq!(
+            accounts.sign_in(&identity).await.unwrap(),
+            SignInOutcome::SignedIn(first.user_id().clone())
+        );
+    }
+
+    /// A plain OAuth 2.0 provider with a hand-written profile mapping.
+    #[tokio::test]
+    async fn own_oauth2_provider_with_custom_mapper() {
+        fn map(profile: serde_json::Value) -> rega::Result<rega::ExternalIdentity> {
+            Ok(rega::ExternalIdentity {
+                provider: ProviderId::new("ignored"),
+                subject: profile["uid"].as_str().unwrap_or_default().to_owned(),
+                email: None,
+                email_verified: false,
+                name: profile["nick"].as_str().map(str::to_owned),
+                avatar_url: None,
+                raw: profile,
+            })
+        }
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"AT"})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/me"))
+            .and(header("authorization", "Bearer AT"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"uid":"u1","nick":"neo"})),
+            )
+            .mount(&server)
+            .await;
+        let spec = ProviderSpec::oauth2(
+            "intranet",
+            endpoints(&server, Some("/me"), None),
+            ProfileMapper::Custom(map),
+        );
+        let client =
+            OAuthClient::new().register(ProviderConfig::custom(spec, "c", "s", "https://a/cb"));
+        let req = client.authorize("intranet").unwrap();
+        let cb = Callback::parse(&format!("code=c&state={}", req.pending.state));
+        let i = client.complete(&cb, &req.pending).await.unwrap();
+        assert_eq!(
+            (i.provider.as_str(), i.subject.as_str(), i.name.as_deref()),
+            ("intranet", "u1", Some("neo"))
+        );
+    }
+
+    #[tokio::test]
+    async fn login_attempt_expires_by_the_injected_clock() {
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let clock = now.clone();
+        let client = OAuthClient::new()
+            .with_clock(move || clock.load(Ordering::Relaxed))
+            .register(ProviderConfig::new(
+                Provider::GitHub,
+                "c",
+                "s",
+                "https://a/cb",
+            ));
+        let req = client.authorize(Provider::GitHub).unwrap();
+        assert_eq!(req.pending.created_at, 1_000_000);
+        let cb = Callback::parse(&format!("code=&state={}", req.pending.state));
+
+        now.store(1_000_000 + 15 * 60, Ordering::Relaxed);
+        assert!(matches!(
+            client.complete(&cb, &req.pending).await,
+            Err(rega::Error::MissingCode)
+        ));
+        now.store(1_000_000 + 15 * 60 + 1, Ordering::Relaxed);
+        assert!(matches!(
+            client.complete(&cb, &req.pending).await,
+            Err(rega::Error::Expired)
+        ));
+    }
+
+    #[test]
+    fn builtin_specs_are_consistent() {
+        for p in Provider::ALL {
+            let spec = p.spec();
+            assert_eq!(spec.id, p);
+            assert_eq!(spec.id.builtin(), Some(p));
+            assert_eq!(spec.pkce, p.supports_pkce());
+            // A nonce is only useful when the id_token can be checked.
+            assert!(!spec.nonce || spec.endpoints.issuer.is_some(), "{p}");
+            assert_eq!(
+                spec.endpoints.emails.is_some(),
+                spec.email_list != rega::EmailList::None,
+                "{p}"
+            );
+            if spec.redirect_flow {
+                assert!(spec.endpoints.authorize.starts_with("https://"), "{p}");
+                assert!(spec.endpoints.token.starts_with("https://"), "{p}");
+            }
+        }
+    }
+
+    #[test]
+    fn network_errors_do_not_expose_third_party_types() {
+        fn assert_source<E: std::error::Error + Send + Sync + 'static>() {}
+        assert_source::<rega::Error>();
+        let err: rega::Error = serde_json::from_str::<rega::TokenResponse>("{}")
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, rega::Error::InvalidResponse(_)));
     }
 }

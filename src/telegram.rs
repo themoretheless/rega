@@ -7,7 +7,7 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::{apple, pkce, profile, Callback, Error, ExternalIdentity, Provider, Result};
+use crate::{clock, pkce, profile, Callback, Error, ExternalIdentity, Provider, Result};
 
 /// Verifies widget data and returns the identity. Data older than
 /// `max_age_secs` is rejected to limit replay of leaked login links.
@@ -44,7 +44,7 @@ pub fn verify_login(
         .get("auth_date")
         .and_then(|d| d.parse().ok())
         .ok_or_else(|| invalid("missing auth_date"))?;
-    if apple::now().saturating_sub(auth_date) > max_age_secs {
+    if clock::now().saturating_sub(auth_date) > max_age_secs {
         return Err(Error::Expired);
     }
 
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn accepts_valid_and_rejects_tampered() {
-        let now = apple::now().to_string();
+        let now = clock::now().to_string();
         let fields = [
             ("id", "123".to_string()),
             ("first_name", "Pavel".to_string()),
@@ -98,8 +98,8 @@ mod tests {
         let data = signed("123:ABC", &fields);
         let i = verify_login(&data, "123:ABC", 86400).unwrap();
         assert_eq!(
-            (i.provider, i.subject.as_str(), i.name.as_deref()),
-            (Provider::Telegram, "123", Some("Pavel"))
+            (i.provider.as_str(), i.subject.as_str(), i.name.as_deref()),
+            ("telegram", "123", Some("Pavel"))
         );
 
         assert!(verify_login(&data, "other-bot", 86400).is_err());

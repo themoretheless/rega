@@ -35,37 +35,38 @@ use axum::routing::get;
 use axum::Router;
 
 use crate::{
-    AccountStore, Accounts, Callback, Error, ExternalIdentity, OAuthClient, PendingAuth, Provider,
-    SignInOutcome,
+    AccountStore, Accounts, Callback, Error, ExternalIdentity, OAuthClient, PendingAuth,
+    ProviderId, SignInOutcome,
 };
 
 const COOKIE: &str = "rega_pending";
 
 /// Successful sign-in passed to the [`AuthRoutes::on_success`] handler.
 #[derive(Debug, Clone)]
-pub struct SignedIn {
-    /// Whether the user signed in, was linked or registered.
-    pub outcome: SignInOutcome,
+pub struct SignedIn<U> {
+    /// Whether the user signed in, was linked or registered; `U` is the
+    /// store's [`UserId`](AccountStore::UserId).
+    pub outcome: SignInOutcome<U>,
     /// Profile returned by the provider.
     pub identity: ExternalIdentity,
 }
 
-type SuccessHandler = Arc<dyn Fn(SignedIn) -> Response + Send + Sync>;
+type SuccessHandler<U> = Arc<dyn Fn(SignedIn<U>) -> Response + Send + Sync>;
 
 /// Builder for the login routes.
-pub struct AuthRoutes<S> {
+pub struct AuthRoutes<S: AccountStore> {
     oauth: OAuthClient,
     accounts: Arc<Accounts<S>>,
     key: [u8; 32],
-    on_success: SuccessHandler,
+    on_success: SuccessHandler<S::UserId>,
     secure_cookie: bool,
 }
 
-struct Shared<S> {
+struct Shared<S: AccountStore> {
     oauth: OAuthClient,
     accounts: Arc<Accounts<S>>,
     key: [u8; 32],
-    on_success: SuccessHandler,
+    on_success: SuccessHandler<S::UserId>,
     secure_cookie: bool,
 }
 
@@ -85,7 +86,7 @@ impl<S: AccountStore + 'static> AuthRoutes<S> {
     /// Response to send after a successful sign-in (default: redirect to `/`).
     pub fn on_success(
         mut self,
-        handler: impl Fn(SignedIn) -> Response + Send + Sync + 'static,
+        handler: impl Fn(SignedIn<S::UserId>) -> Response + Send + Sync + 'static,
     ) -> Self {
         self.on_success = Arc::new(handler);
         self
@@ -124,10 +125,13 @@ async fn start<S: AccountStore + 'static>(
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let cookie_path = cookie_path(uri.path(), 1);
-    let Ok(provider) = provider.parse::<Provider>() else {
-        return (StatusCode::NOT_FOUND, "unknown provider").into_response();
+    // Unknown ids — built-in or custom — are "not configured", answered as 404.
+    let provider = ProviderId::new(provider);
+    let form_post = match shared.oauth.config(&provider) {
+        Ok(config) => config.spec.form_post,
+        Err(e) => return failure(&e),
     };
-    let req = match shared.oauth.authorize(provider) {
+    let req = match shared.oauth.authorize(&provider) {
         Ok(req) => req,
         Err(e) => return failure(&e),
     };
@@ -135,8 +139,9 @@ async fn start<S: AccountStore + 'static>(
         Ok(s) => s,
         Err(e) => return failure(&e),
     };
-    // Apple posts the callback cross-site, which Lax cookies do not survive.
-    let same_site = if provider == Provider::Apple && shared.secure_cookie {
+    // A form_post callback (Apple) is a cross-site POST, which Lax cookies do
+    // not survive.
+    let same_site = if form_post && shared.secure_cookie {
         "None"
     } else {
         "Lax"
@@ -168,7 +173,7 @@ async fn callback<S: AccountStore + 'static>(
     };
     let pending =
         cookie_value(&headers, COOKIE).and_then(|v| PendingAuth::open(v, &shared.key).ok());
-    let Some(pending) = pending.filter(|p| p.provider.as_str() == provider) else {
+    let Some(pending) = pending.filter(|p| p.provider == ProviderId::new(provider)) else {
         return failure(&Error::StateMismatch);
     };
 
