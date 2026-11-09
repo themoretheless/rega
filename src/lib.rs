@@ -57,7 +57,7 @@ pub mod telegram;
 
 pub use account::{
     AccountError, AccountStore, Accounts, ExternalLogin, InMemoryStore, LinkPolicy, NewUser,
-    SignInOutcome, StoreError, UserId,
+    SignInOutcome, StoreError,
 };
 pub use apple::{AppleKey, AppleSigner};
 pub use client::{

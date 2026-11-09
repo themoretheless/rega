@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
-use crate::{AccountStore, ExternalLogin, NewUser, Provider, StoreError, UserId};
+use crate::{AccountStore, ExternalLogin, NewUser, Provider, StoreError};
 
 /// Schema applied by [`PgAccountStore::migrate`]; also shipped as
 /// `migrations/0001_rega.sql` for external migration tools.
@@ -40,14 +40,11 @@ fn other(e: sqlx::Error) -> StoreError {
     StoreError::Other(Box::new(e))
 }
 
-fn parse_id(user: &UserId) -> Result<i64, StoreError> {
-    user.parse()
-        .map_err(|e: std::num::ParseIntError| StoreError::Other(Box::new(e)))
-}
-
 #[async_trait]
 impl AccountStore for PgAccountStore {
-    async fn find_by_login(&self, login: &ExternalLogin) -> Result<Option<UserId>, StoreError> {
+    type UserId = i64;
+
+    async fn find_by_login(&self, login: &ExternalLogin) -> Result<Option<i64>, StoreError> {
         let row =
             sqlx::query("SELECT user_id FROM rega_logins WHERE provider = $1 AND subject = $2")
                 .bind(login.provider.as_str())
@@ -55,10 +52,10 @@ impl AccountStore for PgAccountStore {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(other)?;
-        Ok(row.map(|r| r.get::<i64, _>(0).to_string()))
+        Ok(row.map(|r| r.get::<i64, _>(0)))
     }
 
-    async fn find_by_verified_email(&self, email: &str) -> Result<Option<UserId>, StoreError> {
+    async fn find_by_verified_email(&self, email: &str) -> Result<Option<i64>, StoreError> {
         let row = sqlx::query(
             "SELECT id FROM rega_users WHERE email_verified AND lower(email) = lower($1) ORDER BY id LIMIT 1",
         )
@@ -66,10 +63,13 @@ impl AccountStore for PgAccountStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(other)?;
-        Ok(row.map(|r| r.get::<i64, _>(0).to_string()))
+        Ok(row.map(|r| r.get::<i64, _>(0)))
     }
 
-    async fn create_user(&self, user: NewUser) -> Result<UserId, StoreError> {
+    async fn register(&self, user: NewUser, login: ExternalLogin) -> Result<i64, StoreError> {
+        // One transaction: a concurrent registration of the same login blocks on
+        // the primary key, then sees the conflict and rolls its user back.
+        let mut tx = self.pool.begin().await.map_err(other)?;
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO rega_users (email, email_verified, name, avatar_url) VALUES ($1, $2, $3, $4) RETURNING id",
         )
@@ -77,19 +77,34 @@ impl AccountStore for PgAccountStore {
         .bind(user.email_verified)
         .bind(&user.name)
         .bind(&user.avatar_url)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(other)?;
-        Ok(id.to_string())
-    }
-
-    async fn add_login(&self, user: &UserId, login: ExternalLogin) -> Result<(), StoreError> {
         let inserted = sqlx::query(
             "INSERT INTO rega_logins (provider, subject, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         )
         .bind(login.provider.as_str())
         .bind(&login.subject)
-        .bind(parse_id(user)?)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(other)?
+        .rows_affected();
+        if inserted == 0 {
+            tx.rollback().await.map_err(other)?;
+            return Err(StoreError::Conflict);
+        }
+        tx.commit().await.map_err(other)?;
+        Ok(id)
+    }
+
+    async fn add_login(&self, user: &i64, login: ExternalLogin) -> Result<(), StoreError> {
+        let inserted = sqlx::query(
+            "INSERT INTO rega_logins (provider, subject, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(login.provider.as_str())
+        .bind(&login.subject)
+        .bind(*user)
         .execute(&self.pool)
         .await
         .map_err(other)?
@@ -100,13 +115,13 @@ impl AccountStore for PgAccountStore {
         Ok(())
     }
 
-    async fn remove_login(&self, user: &UserId, login: &ExternalLogin) -> Result<bool, StoreError> {
+    async fn remove_login(&self, user: &i64, login: &ExternalLogin) -> Result<bool, StoreError> {
         let removed = sqlx::query(
             "DELETE FROM rega_logins WHERE provider = $1 AND subject = $2 AND user_id = $3",
         )
         .bind(login.provider.as_str())
         .bind(&login.subject)
-        .bind(parse_id(user)?)
+        .bind(*user)
         .execute(&self.pool)
         .await
         .map_err(other)?
@@ -114,11 +129,11 @@ impl AccountStore for PgAccountStore {
         Ok(removed > 0)
     }
 
-    async fn logins(&self, user: &UserId) -> Result<Vec<ExternalLogin>, StoreError> {
+    async fn logins(&self, user: &i64) -> Result<Vec<ExternalLogin>, StoreError> {
         let rows = sqlx::query(
             "SELECT provider, subject FROM rega_logins WHERE user_id = $1 ORDER BY created_at",
         )
-        .bind(parse_id(user)?)
+        .bind(*user)
         .fetch_all(&self.pool)
         .await
         .map_err(other)?;

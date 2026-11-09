@@ -7,9 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ExternalIdentity, Provider};
 
-/// Local user identifier as stored by the application.
-pub type UserId = String;
-
 /// A provider login attached to a local user.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExternalLogin {
@@ -67,18 +64,37 @@ pub enum StoreError {
 /// your database; the `(provider, subject)` pair must be unique.
 #[async_trait]
 pub trait AccountStore: Send + Sync {
+    /// Local user identifier, in whatever type the storage uses natively
+    /// (`i64` for [`PgAccountStore`](crate::PgAccountStore), `String` for
+    /// [`InMemoryStore`]).
+    type UserId: Clone + PartialEq + std::fmt::Debug + Send + Sync;
+
     /// User owning the login, if any.
-    async fn find_by_login(&self, login: &ExternalLogin) -> Result<Option<UserId>, StoreError>;
+    async fn find_by_login(
+        &self,
+        login: &ExternalLogin,
+    ) -> Result<Option<Self::UserId>, StoreError>;
     /// User whose email is **verified** and equal to `email` (case-insensitive).
-    async fn find_by_verified_email(&self, email: &str) -> Result<Option<UserId>, StoreError>;
-    /// Creates a user and returns its id.
-    async fn create_user(&self, user: NewUser) -> Result<UserId, StoreError>;
+    async fn find_by_verified_email(&self, email: &str)
+        -> Result<Option<Self::UserId>, StoreError>;
+    /// Creates a user with its first login, atomically: either both exist
+    /// afterwards or neither does. Must return [`StoreError::Conflict`] —
+    /// and create no user — if the login already belongs to someone.
+    async fn register(
+        &self,
+        user: NewUser,
+        login: ExternalLogin,
+    ) -> Result<Self::UserId, StoreError>;
     /// Must return [`StoreError::Conflict`] if the login belongs to any user.
-    async fn add_login(&self, user: &UserId, login: ExternalLogin) -> Result<(), StoreError>;
+    async fn add_login(&self, user: &Self::UserId, login: ExternalLogin) -> Result<(), StoreError>;
     /// Detaches `login` from `user`; returns whether it was attached.
-    async fn remove_login(&self, user: &UserId, login: &ExternalLogin) -> Result<bool, StoreError>;
+    async fn remove_login(
+        &self,
+        user: &Self::UserId,
+        login: &ExternalLogin,
+    ) -> Result<bool, StoreError>;
     /// All logins attached to `user`.
-    async fn logins(&self, user: &UserId) -> Result<Vec<ExternalLogin>, StoreError>;
+    async fn logins(&self, user: &Self::UserId) -> Result<Vec<ExternalLogin>, StoreError>;
 }
 
 /// When an unknown login may be attached to an existing account automatically.
@@ -93,19 +109,20 @@ pub enum LinkPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Result of [`Accounts::sign_in`].
-pub enum SignInOutcome {
+/// Result of [`Accounts::sign_in`]; `U` is the store's
+/// [`UserId`](AccountStore::UserId).
+pub enum SignInOutcome<U> {
     /// Known login — existing user.
-    SignedIn(UserId),
+    SignedIn(U),
     /// New login attached to an existing user via verified email.
-    Linked(UserId),
+    Linked(U),
     /// New user created.
-    Registered(UserId),
+    Registered(U),
 }
 
-impl SignInOutcome {
+impl<U> SignInOutcome<U> {
     /// The local user id, whatever the outcome.
-    pub fn user_id(&self) -> &UserId {
+    pub fn user_id(&self) -> &U {
         match self {
             Self::SignedIn(u) | Self::Linked(u) | Self::Registered(u) => u,
         }
@@ -156,7 +173,7 @@ impl<S: AccountStore> Accounts<S> {
     pub async fn sign_in(
         &self,
         identity: &ExternalIdentity,
-    ) -> Result<SignInOutcome, AccountError> {
+    ) -> Result<SignInOutcome<S::UserId>, AccountError> {
         let login = ExternalLogin::from(identity);
         if let Some(user) = self.store.find_by_login(&login).await? {
             return Ok(SignInOutcome::SignedIn(user));
@@ -174,16 +191,19 @@ impl<S: AccountStore> Accounts<S> {
             }
         }
 
-        let user = self.store.create_user(NewUser::from(identity)).await?;
-        match self.store.add_login(&user, login.clone()).await {
-            Ok(()) => Ok(SignInOutcome::Registered(user)),
+        let registered = self.store.register(NewUser::from(identity), login.clone());
+        match registered.await {
+            Ok(user) => Ok(SignInOutcome::Registered(user)),
             Err(StoreError::Conflict) => self.after_race(&login).await,
             Err(e) => Err(e.into()),
         }
     }
 
     /// Concurrent first sign-in with the same login: the other request won.
-    async fn after_race(&self, login: &ExternalLogin) -> Result<SignInOutcome, AccountError> {
+    async fn after_race(
+        &self,
+        login: &ExternalLogin,
+    ) -> Result<SignInOutcome<S::UserId>, AccountError> {
         match self.store.find_by_login(login).await? {
             Some(user) => Ok(SignInOutcome::SignedIn(user)),
             None => Err(StoreError::Conflict.into()),
@@ -193,7 +213,7 @@ impl<S: AccountStore> Accounts<S> {
     /// Attaches another provider to a signed-in user ("Connect GitHub" button).
     pub async fn link(
         &self,
-        user: &UserId,
+        user: &S::UserId,
         identity: &ExternalIdentity,
     ) -> Result<(), AccountError> {
         let login = ExternalLogin::from(identity);
@@ -213,7 +233,7 @@ impl<S: AccountStore> Accounts<S> {
     /// `has_other_credentials` (e.g. the user has a password or passkey).
     pub async fn unlink(
         &self,
-        user: &UserId,
+        user: &S::UserId,
         login: &ExternalLogin,
         has_other_credentials: bool,
     ) -> Result<bool, AccountError> {
@@ -237,11 +257,11 @@ pub struct InMemoryStore {
 
 #[derive(Debug, Default)]
 struct Inner {
-    users: HashMap<UserId, NewUser>,
-    logins: HashMap<ExternalLogin, UserId>,
-    user_logins: HashMap<UserId, Vec<ExternalLogin>>,
+    users: HashMap<String, NewUser>,
+    logins: HashMap<ExternalLogin, String>,
+    user_logins: HashMap<String, Vec<ExternalLogin>>,
     /// Lower-cased verified email -> first user registered with it.
-    verified_emails: HashMap<String, UserId>,
+    verified_emails: HashMap<String, String>,
 }
 
 impl InMemoryStore {
@@ -251,8 +271,13 @@ impl InMemoryStore {
     }
 
     /// Profile of a user, if it exists.
-    pub fn user(&self, id: &UserId) -> Option<NewUser> {
+    pub fn user(&self, id: &str) -> Option<NewUser> {
         self.read().users.get(id).cloned()
+    }
+
+    /// Number of users, including any without a login.
+    pub fn user_count(&self) -> usize {
+        self.read().users.len()
     }
 
     fn read(&self) -> RwLockReadGuard<'_, Inner> {
@@ -266,11 +291,13 @@ impl InMemoryStore {
 
 #[async_trait]
 impl AccountStore for InMemoryStore {
-    async fn find_by_login(&self, login: &ExternalLogin) -> Result<Option<UserId>, StoreError> {
+    type UserId = String;
+
+    async fn find_by_login(&self, login: &ExternalLogin) -> Result<Option<String>, StoreError> {
         Ok(self.read().logins.get(login).cloned())
     }
 
-    async fn find_by_verified_email(&self, email: &str) -> Result<Option<UserId>, StoreError> {
+    async fn find_by_verified_email(&self, email: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .read()
             .verified_emails
@@ -278,9 +305,13 @@ impl AccountStore for InMemoryStore {
             .cloned())
     }
 
-    async fn create_user(&self, user: NewUser) -> Result<UserId, StoreError> {
-        let id = (self.next_id.fetch_add(1, Ordering::Relaxed) + 1).to_string();
+    async fn register(&self, user: NewUser, login: ExternalLogin) -> Result<String, StoreError> {
+        // One write lock covers the check and both inserts.
         let mut inner = self.write();
+        if inner.logins.contains_key(&login) {
+            return Err(StoreError::Conflict);
+        }
+        let id = (self.next_id.fetch_add(1, Ordering::Relaxed) + 1).to_string();
         if let (true, Some(email)) = (user.email_verified, &user.email) {
             inner
                 .verified_emails
@@ -288,10 +319,12 @@ impl AccountStore for InMemoryStore {
                 .or_insert_with(|| id.clone());
         }
         inner.users.insert(id.clone(), user);
+        inner.user_logins.insert(id.clone(), vec![login.clone()]);
+        inner.logins.insert(login, id.clone());
         Ok(id)
     }
 
-    async fn add_login(&self, user: &UserId, login: ExternalLogin) -> Result<(), StoreError> {
+    async fn add_login(&self, user: &String, login: ExternalLogin) -> Result<(), StoreError> {
         let mut inner = self.write();
         if inner.logins.contains_key(&login) {
             return Err(StoreError::Conflict);
@@ -305,7 +338,7 @@ impl AccountStore for InMemoryStore {
         Ok(())
     }
 
-    async fn remove_login(&self, user: &UserId, login: &ExternalLogin) -> Result<bool, StoreError> {
+    async fn remove_login(&self, user: &String, login: &ExternalLogin) -> Result<bool, StoreError> {
         let mut inner = self.write();
         if inner.logins.get(login) != Some(user) {
             return Ok(false);
@@ -317,7 +350,7 @@ impl AccountStore for InMemoryStore {
         Ok(true)
     }
 
-    async fn logins(&self, user: &UserId) -> Result<Vec<ExternalLogin>, StoreError> {
+    async fn logins(&self, user: &String) -> Result<Vec<ExternalLogin>, StoreError> {
         Ok(self
             .read()
             .user_logins
@@ -431,5 +464,47 @@ mod tests {
             Err(AccountError::LastLogin)
         ));
         assert!(accounts.unlink(&u1, &last, true).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_first_sign_in_creates_one_user() {
+        let accounts = std::sync::Arc::new(Accounts::new(InMemoryStore::new()));
+        let racer = identity(Provider::Discord, "race", None, false);
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let (accounts, racer) = (accounts.clone(), racer.clone());
+                tokio::spawn(
+                    async move { accounts.sign_in(&racer).await.unwrap().user_id().clone() },
+                )
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for task in tasks {
+            ids.push(task.await.unwrap());
+        }
+        ids.dedup();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(accounts.store().user_count(), 1, "no orphaned users");
+    }
+
+    #[tokio::test]
+    async fn register_conflict_creates_no_user() {
+        let store = InMemoryStore::new();
+        let login = ExternalLogin {
+            provider: Provider::Google,
+            subject: "g".into(),
+        };
+        let user = NewUser {
+            email: None,
+            email_verified: false,
+            name: None,
+            avatar_url: None,
+        };
+        store.register(user.clone(), login.clone()).await.unwrap();
+        assert!(matches!(
+            store.register(user, login).await,
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(store.user_count(), 1);
     }
 }

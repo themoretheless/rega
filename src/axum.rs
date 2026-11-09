@@ -43,29 +43,30 @@ const COOKIE: &str = "rega_pending";
 
 /// Successful sign-in passed to the [`AuthRoutes::on_success`] handler.
 #[derive(Debug, Clone)]
-pub struct SignedIn {
-    /// Whether the user signed in, was linked or registered.
-    pub outcome: SignInOutcome,
+pub struct SignedIn<U> {
+    /// Whether the user signed in, was linked or registered; `U` is the
+    /// store's [`UserId`](AccountStore::UserId).
+    pub outcome: SignInOutcome<U>,
     /// Profile returned by the provider.
     pub identity: ExternalIdentity,
 }
 
-type SuccessHandler = Arc<dyn Fn(SignedIn) -> Response + Send + Sync>;
+type SuccessHandler<U> = Arc<dyn Fn(SignedIn<U>) -> Response + Send + Sync>;
 
 /// Builder for the login routes.
-pub struct AuthRoutes<S> {
+pub struct AuthRoutes<S: AccountStore> {
     oauth: OAuthClient,
     accounts: Arc<Accounts<S>>,
     key: [u8; 32],
-    on_success: SuccessHandler,
+    on_success: SuccessHandler<S::UserId>,
     secure_cookie: bool,
 }
 
-struct Shared<S> {
+struct Shared<S: AccountStore> {
     oauth: OAuthClient,
     accounts: Arc<Accounts<S>>,
     key: [u8; 32],
-    on_success: SuccessHandler,
+    on_success: SuccessHandler<S::UserId>,
     secure_cookie: bool,
 }
 
@@ -85,7 +86,7 @@ impl<S: AccountStore + 'static> AuthRoutes<S> {
     /// Response to send after a successful sign-in (default: redirect to `/`).
     pub fn on_success(
         mut self,
-        handler: impl Fn(SignedIn) -> Response + Send + Sync + 'static,
+        handler: impl Fn(SignedIn<S::UserId>) -> Response + Send + Sync + 'static,
     ) -> Self {
         self.on_success = Arc::new(handler);
         self

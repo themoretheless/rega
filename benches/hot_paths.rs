@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rega::{
-    AccountStore, Accounts, AppleKey, AppleSigner, ExternalIdentity, InMemoryStore, NewUser,
-    OAuthClient, Provider, ProviderConfig,
+    AccountStore, Accounts, AppleKey, AppleSigner, ExternalIdentity, ExternalLogin, InMemoryStore,
+    NewUser, OAuthClient, Provider, ProviderConfig,
 };
 
 const PEM: &str = include_str!("../tests/apple_test_key.p8");
@@ -44,15 +44,17 @@ fn store(c: &mut Criterion) {
     let store = InMemoryStore::new();
     rt.block_on(async {
         for i in 0..10_000 {
-            store
-                .create_user(NewUser {
-                    email: Some(format!("user{i}@example.com")),
-                    email_verified: true,
-                    name: None,
-                    avatar_url: None,
-                })
-                .await
-                .unwrap();
+            let user = NewUser {
+                email: Some(format!("user{i}@example.com")),
+                email_verified: true,
+                name: None,
+                avatar_url: None,
+            };
+            let login = ExternalLogin {
+                provider: Provider::GitHub,
+                subject: i.to_string(),
+            };
+            store.register(user, login).await.unwrap();
         }
     });
     let accounts = Accounts::new(store);
